@@ -26,13 +26,19 @@ template <typename Proc>
 class GeneralShaderCompileTask : public CompiledShader {
 public:
   GeneralShaderCompileTask(MTLD3D11Device *pDevice, ManagedShader shader,
-                           Proc &&proc, std::string func_name, const Sha1Digest& variant_digest)
+                           Proc &&proc, std::string func_name, const Sha1Digest& variant_digest,
+                           std::vector<ManagedShader> extra_ir_holders = {})
       : CompiledShader(), proc(std::forward<Proc>(proc)), func_name(func_name), device_(pDevice),
         shader_(shader), variant_digest_(variant_digest) {
     sm50_common.type = SM50_SHADER_COMMON;
     sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetDXMTDevice().metalVersion();
     sm50_common.flags = getGlobalShaderFlag();
     sm50_common.next = nullptr;
+    ir_holders_.push_back(shader_);
+    for (auto &s : extra_ir_holders)
+      ir_holders_.push_back(s);
+    for (auto &s : ir_holders_)
+      s->ir_use_begin();
   }
 
   ~GeneralShaderCompileTask() {}
@@ -47,6 +53,14 @@ public:
 
   ThreadpoolWork *
   RunThreadpoolWork() {
+    /* Covers every exit path: cache hit, successful compile, compile error. */
+    struct IrUseGuard {
+      std::vector<ManagedShader> &holders;
+      ~IrUseGuard() {
+        for (auto &s : holders)
+          s->ir_use_end();
+      }
+    } ir_guard{ir_holders_};
     auto pool = WMT::MakeAutoreleasePool();
     WMT::Reference<WMT::Error> err;
     WMT::Reference<WMT::DispatchData> lib_data = shader_->find_cached_variant(variant_digest_);
@@ -71,6 +85,8 @@ public:
     }
 
     if (!lib_data) {
+      for (auto &s : ir_holders_)
+        s->ir_ensure();
       SM50_COMPILED_BITCODE bitcode;
       sm50_bitcode_t compile_result = proc(func_name.c_str(), &sm50_common);
 
@@ -114,6 +130,7 @@ private:
   Sha1Digest variant_digest_;
   std::atomic_bool ready_;
   WMT::Reference<WMT::Function> function_;
+  std::vector<ManagedShader> ir_holders_;
 };
 
 template <>
@@ -268,7 +285,8 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     return compile_result;
   };
   return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
-      pDevice, shader, std::move(proc), func_name, variant_digest);
+      pDevice, shader, std::move(proc), func_name, variant_digest,
+      std::vector<ManagedShader>{variant.vertex_shader_handle});
 }
 
 template <>
@@ -306,7 +324,8 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     return compile_result;
   };
   return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
-      pDevice, shader, std::move(proc), func_name, variant_digest);
+      pDevice, shader, std::move(proc), func_name, variant_digest,
+      std::vector<ManagedShader>{variant.hull_shader_handle});
 }
 
 template <>
@@ -406,7 +425,8 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     return compile_result;
   };
   return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
-      pDevice, shader, std::move(proc), func_name, variant_digest);
+      pDevice, shader, std::move(proc), func_name, variant_digest,
+      std::vector<ManagedShader>{variant.geometry_shader_handle});
 }
 
 template <>
@@ -438,7 +458,8 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     return compile_result;
   };
   return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
-      pDevice, shader, std::move(proc), func_name, variant_digest);
+      pDevice, shader, std::move(proc), func_name, variant_digest,
+      std::vector<ManagedShader>{variant.vertex_shader_handle});
 }
 
 } // namespace dxmt

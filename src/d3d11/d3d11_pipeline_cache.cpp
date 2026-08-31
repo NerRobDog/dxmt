@@ -1,5 +1,6 @@
 #include "d3d11_pipeline_cache.hpp"
 #include "airconv_public.h"
+#include "config/config.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_shader.hpp"
 #include "d3d11_pipeline.hpp"
@@ -65,6 +66,9 @@ template <> struct task_trait<ThreadpoolWork *> {
   void set_done(ThreadpoolWork *task) { task->SetIsDone(true); }
 };
 
+static std::atomic<uint64_t> g_ir_released_total{0};
+static std::atomic<uint64_t> g_dxbc_retained_total{0};
+
 class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   class CachedSM50Shader final : public Shader {
@@ -74,6 +78,15 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     MTL_SHADER_REFLECTION reflection_;
     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
+
+    /* IR lifetime management (d3d11.releaseShaderIR): a copy of the DXBC
+     * blob outlives the parsed IR so that the IR can be rematerialized on
+     * a late cache miss. Guarded by ir_mutex_. */
+    void *dxbc_ = nullptr;
+    size_t dxbc_length_ = 0;
+    dxmt::mutex ir_mutex_;
+    uint32_t ir_pending_ = 0;
+    bool ir_released_ = false;
 
   public:
     CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
@@ -98,6 +111,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         if (arguments_info_buffer)
           free(arguments_info_buffer);
         shader = nullptr;
+      }
+      if (dxbc_) {
+        free(dxbc_);
+        dxbc_ = nullptr;
       }
     };
 
@@ -125,6 +142,59 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       return c.first->second.get();
     }
     virtual const Sha1Digest &sha1() { return sha1_; };
+
+    void store_dxbc(const void *pBytecode, size_t BytecodeLength) {
+      dxbc_ = malloc(BytecodeLength);
+      dxbc_length_ = BytecodeLength;
+      memcpy(dxbc_, pBytecode, BytecodeLength);
+      g_dxbc_retained_total += BytecodeLength;
+    }
+
+    virtual void ir_use_begin() final {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      ir_pending_++;
+    }
+    virtual void ir_ensure() final {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      if (ir_released_) {
+        sm50_shader_t sm50 = nullptr;
+        MTL_SHADER_REFLECTION reflection;
+        sm50_error_t err = nullptr;
+        if (SM50Initialize(dxbc_, dxbc_length_, &sm50, &reflection, &err)) {
+          ERR("Failed to rematerialize shader IR: ",
+              SM50GetErrorMessageString(err));
+          SM50FreeError(err);
+          return; /* handle()==nullptr -> variant compile fails gracefully */
+        }
+        shader = sm50;
+        ir_released_ = false;
+      }
+    }
+    /* Release immediately when no compile task is in flight; used right
+     * after creation so shaders that never get a variant request do not
+     * retain their IR. */
+    void ir_release_if_idle() {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      if (ir_pending_ == 0 && dxbc_ && shader) {
+        SM50Destroy(shader);
+        shader = nullptr;
+        ir_released_ = true;
+        uint64_t n = ++g_ir_released_total;
+        if ((n & 0xfff) == 0)
+          WARN("shader IR released: ", n, " shaders; DXBC retained: ",
+               g_dxbc_retained_total.load() >> 20, " MB");
+      }
+    }
+    virtual void ir_use_end() final {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      ir_pending_--;
+      if (ir_pending_ == 0 && cache->release_ir_ && dxbc_ && shader) {
+        SM50Destroy(shader);
+        shader = nullptr;
+        ir_released_ = true;
+        ++g_ir_released_total;
+      }
+    }
 
 #ifdef DXMT_DEBUG
     void *bytecode;
@@ -190,6 +260,9 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   ShaderCache& scache_;
 
+  bool release_ir_ =
+      Config::getInstance().getOption<bool>("d3d11.releaseShaderIR", true);
+
   task_scheduler<ThreadpoolWork *> scheduler_;
 
   MTLD3D11Device *device;
@@ -247,6 +320,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       shader->bytecode_length = BytecodeLength;
       memcpy(shader->bytecode, pBytecode, BytecodeLength);
 #endif
+      if (release_ir_) {
+        shader->store_dxbc(pBytecode, BytecodeLength);
+        shader->ir_release_if_idle();
+      }
       return shaders_.emplace(sha1, std::move(shader)).first->second.get();
     }
   }
