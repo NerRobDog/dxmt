@@ -66,6 +66,9 @@ template <> struct task_trait<ThreadpoolWork *> {
   void set_done(ThreadpoolWork *task) { task->SetIsDone(true); }
 };
 
+static std::atomic<uint64_t> g_ir_released_total{0};
+static std::atomic<uint64_t> g_dxbc_retained_total{0};
+
 class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   class CachedSM50Shader final : public Shader {
@@ -144,6 +147,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       dxbc_ = malloc(BytecodeLength);
       dxbc_length_ = BytecodeLength;
       memcpy(dxbc_, pBytecode, BytecodeLength);
+      g_dxbc_retained_total += BytecodeLength;
     }
 
     virtual void ir_use_begin() final {
@@ -175,6 +179,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         SM50Destroy(shader);
         shader = nullptr;
         ir_released_ = true;
+        uint64_t n = ++g_ir_released_total;
+        if ((n & 0xfff) == 0)
+          WARN("shader IR released: ", n, " shaders; DXBC retained: ",
+               g_dxbc_retained_total.load() >> 20, " MB");
       }
     }
     virtual void ir_use_end() final {
@@ -184,6 +192,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         SM50Destroy(shader);
         shader = nullptr;
         ir_released_ = true;
+        ++g_ir_released_total;
       }
     }
 
