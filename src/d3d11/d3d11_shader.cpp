@@ -85,6 +85,8 @@ public:
     }
 
     if (!lib_data) {
+      for (auto &s : ir_holders_)
+        s->ir_ensure();
       SM50_COMPILED_BITCODE bitcode;
       sm50_bitcode_t compile_result = proc(func_name.c_str(), &sm50_common);
 

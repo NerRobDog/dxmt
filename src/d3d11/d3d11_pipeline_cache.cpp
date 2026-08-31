@@ -149,6 +149,9 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     virtual void ir_use_begin() final {
       std::lock_guard<dxmt::mutex> lock(ir_mutex_);
       ir_pending_++;
+    }
+    virtual void ir_ensure() final {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
       if (ir_released_) {
         sm50_shader_t sm50 = nullptr;
         MTL_SHADER_REFLECTION reflection;
@@ -161,6 +164,17 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         }
         shader = sm50;
         ir_released_ = false;
+      }
+    }
+    /* Release immediately when no compile task is in flight; used right
+     * after creation so shaders that never get a variant request do not
+     * retain their IR. */
+    void ir_release_if_idle() {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      if (ir_pending_ == 0 && dxbc_ && shader) {
+        SM50Destroy(shader);
+        shader = nullptr;
+        ir_released_ = true;
       }
     }
     virtual void ir_use_end() final {
@@ -297,8 +311,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       shader->bytecode_length = BytecodeLength;
       memcpy(shader->bytecode, pBytecode, BytecodeLength);
 #endif
-      if (release_ir_)
+      if (release_ir_) {
         shader->store_dxbc(pBytecode, BytecodeLength);
+        shader->ir_release_if_idle();
+      }
       return shaders_.emplace(sha1, std::move(shader)).first->second.get();
     }
   }

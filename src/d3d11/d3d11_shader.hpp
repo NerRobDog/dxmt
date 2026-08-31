@@ -216,9 +216,12 @@ public:
   virtual void dump() = 0;
 
   /* IR lifetime management: a compile task that may call handle() of this
-   * shader brackets its use with begin/end. Default: no-op. */
+   * shader brackets its use with begin/end; ir_ensure() materializes the IR
+   * (allowed only between begin and end) right before handle() is actually
+   * needed, i.e. on a shader-cache miss. Default: no-op. */
   virtual void ir_use_begin() {}
   virtual void ir_use_end() {}
+  virtual void ir_ensure() {}
 
   virtual WMT::Reference<WMT::DispatchData> find_cached_variant(Sha1Digest &key) = 0;
   virtual void update_cached_variant(Sha1Digest &key, WMT::DispatchData data) = 0;
