@@ -140,13 +140,37 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     }
     virtual const Sha1Digest &sha1() { return sha1_; };
 
+    void store_dxbc(const void *pBytecode, size_t BytecodeLength) {
+      dxbc_ = malloc(BytecodeLength);
+      dxbc_length_ = BytecodeLength;
+      memcpy(dxbc_, pBytecode, BytecodeLength);
+    }
+
     virtual void ir_use_begin() final {
       std::lock_guard<dxmt::mutex> lock(ir_mutex_);
       ir_pending_++;
+      if (ir_released_) {
+        sm50_shader_t sm50 = nullptr;
+        MTL_SHADER_REFLECTION reflection;
+        sm50_error_t err = nullptr;
+        if (SM50Initialize(dxbc_, dxbc_length_, &sm50, &reflection, &err)) {
+          ERR("Failed to rematerialize shader IR: ",
+              SM50GetErrorMessageString(err));
+          SM50FreeError(err);
+          return; /* handle()==nullptr -> variant compile fails gracefully */
+        }
+        shader = sm50;
+        ir_released_ = false;
+      }
     }
     virtual void ir_use_end() final {
       std::lock_guard<dxmt::mutex> lock(ir_mutex_);
       ir_pending_--;
+      if (ir_pending_ == 0 && cache->release_ir_ && dxbc_ && shader) {
+        SM50Destroy(shader);
+        shader = nullptr;
+        ir_released_ = true;
+      }
     }
 
 #ifdef DXMT_DEBUG
@@ -273,6 +297,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       shader->bytecode_length = BytecodeLength;
       memcpy(shader->bytecode, pBytecode, BytecodeLength);
 #endif
+      if (release_ir_)
+        shader->store_dxbc(pBytecode, BytecodeLength);
       return shaders_.emplace(sha1, std::move(shader)).first->second.get();
     }
   }
