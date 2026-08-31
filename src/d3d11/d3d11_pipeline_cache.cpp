@@ -1,5 +1,6 @@
 #include "d3d11_pipeline_cache.hpp"
 #include "airconv_public.h"
+#include "config/config.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_shader.hpp"
 #include "d3d11_pipeline.hpp"
@@ -75,6 +76,15 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
 
+    /* IR lifetime management (d3d11.releaseShaderIR): a copy of the DXBC
+     * blob outlives the parsed IR so that the IR can be rematerialized on
+     * a late cache miss. Guarded by ir_mutex_. */
+    void *dxbc_ = nullptr;
+    size_t dxbc_length_ = 0;
+    dxmt::mutex ir_mutex_;
+    uint32_t ir_pending_ = 0;
+    bool ir_released_ = false;
+
   public:
     CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
                      const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection)
@@ -98,6 +108,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         if (arguments_info_buffer)
           free(arguments_info_buffer);
         shader = nullptr;
+      }
+      if (dxbc_) {
+        free(dxbc_);
+        dxbc_ = nullptr;
       }
     };
 
@@ -189,6 +203,9 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   };
 
   ShaderCache& scache_;
+
+  bool release_ir_ =
+      Config::getInstance().getOption<bool>("d3d11.releaseShaderIR", true);
 
   task_scheduler<ThreadpoolWork *> scheduler_;
 
