@@ -173,7 +173,9 @@ public:
 
     pDesc->SubSysId = 0;
     pDesc->Revision = 0;
-    if (device_.hasUnifiedMemory())
+    if (options_.customVideoMemory > 0)
+      pDesc->DedicatedVideoMemory = uint64_t(options_.customVideoMemory) << 20;
+    else if (device_.hasUnifiedMemory())
       pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize() / 2; // FIXME: use a more appropriate value
     else
       pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize();
@@ -244,7 +246,10 @@ public:
       return E_INVALIDARG;
 
     // we don't actually care about MemorySegmentGroup
-    pVideoMemoryInfo->Budget = device_.recommendedMaxWorkingSetSize();
+    if (options_.customVideoMemory > 0)
+      pVideoMemoryInfo->Budget = uint64_t(options_.customVideoMemory) << 20;
+    else
+      pVideoMemoryInfo->Budget = device_.recommendedMaxWorkingSetSize();
     pVideoMemoryInfo->CurrentUsage = device_.currentAllocatedSize();
     pVideoMemoryInfo->AvailableForReservation = 0;
     pVideoMemoryInfo->CurrentReservation =

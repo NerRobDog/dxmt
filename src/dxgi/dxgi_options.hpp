@@ -20,6 +20,14 @@ struct DxgiOptions {
   int32_t customDeviceId;
   std::string customDeviceDesc;
   bool forceSDR;
+
+  /// Override the amount of video memory reported to the
+  /// application, in megabytes. Affects both the adapter
+  /// descriptor and the budget returned by
+  /// QueryVideoMemoryInfo. 0 or negative keeps the default
+  /// behaviour. Useful on unified-memory systems where the
+  /// default budget lets games oversubscribe system RAM.
+  int32_t customVideoMemory;
 };
 
 } // namespace dxmt

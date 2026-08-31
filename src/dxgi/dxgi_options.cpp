@@ -33,6 +33,8 @@ DxgiOptions::DxgiOptions(const Config &config) {
   this->customDeviceDesc =
       config.getOption<std::string>("dxgi.customDeviceDesc", "");
   this->forceSDR = config.getOption<bool>("dxgi.forceSDR", false);
+  this->customVideoMemory =
+      config.getOption<int>("dxgi.customVideoMemory", 0);
 }
 
 } // namespace dxmt
