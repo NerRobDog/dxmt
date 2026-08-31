@@ -140,6 +140,15 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     }
     virtual const Sha1Digest &sha1() { return sha1_; };
 
+    virtual void ir_use_begin() final {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      ir_pending_++;
+    }
+    virtual void ir_use_end() final {
+      std::lock_guard<dxmt::mutex> lock(ir_mutex_);
+      ir_pending_--;
+    }
+
 #ifdef DXMT_DEBUG
     void *bytecode;
     size_t bytecode_length;
