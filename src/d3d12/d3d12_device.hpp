@@ -56,7 +56,7 @@ public:
 
 class MTLD3D12CommandQueue : public ID3D12CommandQueue {
 public:
-  virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable) = 0;
+  virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) = 0;
 };
 
 class MTLD3D12Resource : public ID3D12Resource {
@@ -162,6 +162,8 @@ public:
   virtual WMT::Device GetMTLDevice() = 0;
 
   virtual D3D_FEATURE_LEVEL GetFeatureLevel() = 0;
+
+  virtual HRESULT GetAdapter(REFIID riid, void **ppAdapter) = 0;
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
 
