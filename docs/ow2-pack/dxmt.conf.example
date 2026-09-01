@@ -1,0 +1,20 @@
+# DXMT config — ow2-pack v0.1 recommended baseline.
+# Point the bottle env DXMT_CONFIG_FILE at this file (absolute path).
+
+# Frame pacing: integer divisor of your display refresh rate.
+# 120 Hz panel -> 60 gives a flat 16.7 ms frametime; 60 Hz panel -> 60 as well.
+d3d11.preferredMaxFrameRate = 60
+
+# The memory fix. Default is already True in this build; set False to get
+# stock DXMT behaviour (for A/B comparison).
+d3d11.releaseShaderIR = True
+
+# Optional: sharper picture via MetalFX spatial upscaling of the output
+# (renders at the game resolution, presents at 1.33x). Requires the bottle env:
+#   "DXMT_METALFX_SPATIAL_SWAPCHAIN" = "1"
+# Comment out if you don't want it.
+d3d11.metalSpatialUpscaleFactor = 1.33
+
+# Optional: cap the video memory reported to the game, in MB (0 = default).
+# Most games don't need this; kept for experimentation.
+# dxgi.customVideoMemory = 0
