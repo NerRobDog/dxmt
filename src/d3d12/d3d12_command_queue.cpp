@@ -21,9 +21,15 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 #include "dxgi_interfaces.h"
+#include "dxmt_statistics.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
+#include "util_likely.hpp"
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 
 namespace dxmt {
 
@@ -47,6 +53,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
   dxmt::thread inflight_cmdbuf_wait_thread_;
+
+  // DXMT_FRAME_LOG per-frame CSV logger state (d3d12 variant)
+  bool frame_log_checked_ = false;
+  std::FILE *frame_log_ = nullptr;
+  std::chrono::steady_clock::time_point frame_log_last_{};
+  uint64_t frame_log_frame_ = 0;
+  uint64_t frame_log_compiles_ = 0;
 
   dxmt::mutex mutex_commit_;
 
@@ -396,7 +409,47 @@ public:
       cmdbuf.presentDrawable(drawable);
     scope.inflight.semaphore = hLantecyWaitable;
 
+    FrameLogTick();
+
     return S_OK;
+  }
+
+  // Per-frame CSV logger, enabled by env DXMT_FRAME_LOG=<path-prefix>.
+  // Slimmer than the d3d11 variant: no FrameStatistics on this path, so only
+  // present-to-present delta, in-flight command buffer count and PSO compiles.
+  void
+  FrameLogTick() {
+    if (unlikely(!frame_log_checked_)) {
+      frame_log_checked_ = true;
+      if (const char *prefix = std::getenv("DXMT_FRAME_LOG")) {
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s-d3d12-%d.csv", prefix, (int)getpid());
+        frame_log_ = std::fopen(path, "w");
+        if (frame_log_) {
+          std::setvbuf(frame_log_, nullptr, _IOFBF, 1 << 20);
+          std::fputs("frame,dt_us,inflight,compiles\n", frame_log_);
+        }
+      }
+    }
+    if (likely(!frame_log_))
+      return;
+    auto now = std::chrono::steady_clock::now();
+    if (frame_log_frame_ > 0) {
+      long dt_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(now - frame_log_last_).count();
+      uint64_t compiles_total = g_compiled_shader_variants.load(std::memory_order_relaxed);
+      std::fprintf(
+          frame_log_, "%llu,%ld,%llu,%llu\n", (unsigned long long)frame_log_frame_, dt_us,
+          (unsigned long long)inflight_cmdbuf_count_.load(std::memory_order_relaxed),
+          (unsigned long long)(compiles_total - frame_log_compiles_));
+      frame_log_compiles_ = compiles_total;
+      if ((frame_log_frame_ & 0xff) == 0)
+        std::fflush(frame_log_);
+    } else {
+      // baseline so the first row doesn't absorb all load-time compiles
+      frame_log_compiles_ = g_compiled_shader_variants.load(std::memory_order_relaxed);
+    }
+    frame_log_last_ = now;
+    frame_log_frame_++;
   }
 };
 

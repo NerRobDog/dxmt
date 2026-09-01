@@ -19,6 +19,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_statistics.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "sha1/sha1_util.hpp"
@@ -454,6 +455,7 @@ public:
 
       sm50_bitcode_t vs_bitcode;
 
+      g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
       if (SM50Compile(
               shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
           )) {
@@ -513,6 +515,7 @@ public:
       rootsig.next = &data_ps;
 
       sm50_bitcode_t ps_bitcode;
+      g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
       if (SM50Compile(
               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
           )) {

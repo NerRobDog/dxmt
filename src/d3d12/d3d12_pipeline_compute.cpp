@@ -20,6 +20,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "dxmt_statistics.hpp"
 #include "log/log.hpp"
 #include "airconv_public.h"
 
@@ -65,6 +66,7 @@ public:
 
     sm50_bitcode_t cs_bitcode;
 
+    g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
     if (SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &cs_bitcode, &sm50_err)) {
       ERR("Failed to compile cs shader");
       return E_FAIL;
