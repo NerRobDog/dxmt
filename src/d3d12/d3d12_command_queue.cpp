@@ -376,7 +376,7 @@ public:
   }
 
   HRESULT
-  Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable) {
+  Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) {
     auto scope = StartCommitting();
     auto &cmdbuf = scope.inflight.cmdbuf;
 
@@ -390,7 +390,10 @@ public:
         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
     );
 
-    cmdbuf.presentDrawable(drawable);
+    if (after > 0)
+      cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
+    else
+      cmdbuf.presentDrawable(drawable);
     scope.inflight.semaphore = hLantecyWaitable;
 
     return S_OK;
