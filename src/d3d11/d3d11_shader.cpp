@@ -3,6 +3,7 @@
 #include "airconv_public.h"
 #include "config/config.hpp"
 #include "d3d11_input_layout.hpp"
+#include "dxmt_statistics.hpp"
 #include "sha1/sha1_util.hpp"
 #include <mutex>
 
@@ -85,6 +86,7 @@ public:
     }
 
     if (!lib_data) {
+      g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
       for (auto &s : ir_holders_)
         s->ir_ensure();
       SM50_COMPILED_BITCODE bitcode;

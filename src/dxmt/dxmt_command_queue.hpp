@@ -36,8 +36,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <span>
+#include <unistd.h>
 
 namespace dxmt {
 
@@ -172,6 +174,12 @@ private:
   uint64_t frame_count = 0;
   uint32_t max_latency_ = 3;
 
+  // DXMT_FRAME_LOG per-frame CSV logger state
+  bool frame_log_checked_ = false;
+  std::FILE *frame_log_ = nullptr;
+  clock::time_point frame_log_last_{};
+  uint64_t frame_log_compiles_ = 0;
+
   dxmt::thread encodeThread;
   dxmt::thread finishThread;
   WMT::Device device;
@@ -262,7 +270,7 @@ public:
     statistics.compute(frame_count);
     frame_count++;
     statistics.at(frame_count).reset();
-    // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering 
+    // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering
     if (likely(frame_count > max_latency_)) {
       auto t0 = clock::now();
       frame_latency_fence_.wait(frame_count - max_latency_);
@@ -270,6 +278,45 @@ public:
       statistics.at(frame_count).present_latency_interval += (t1 - t0);
     }
     statistics.at(frame_count).latency = max_latency_;
+    FrameLogTick();
+  }
+
+  // Per-frame CSV logger, enabled by env DXMT_FRAME_LOG=<path-prefix>.
+  // Plain buffered file writes on the present thread; no os_log involved.
+  void
+  FrameLogTick() {
+    if (unlikely(!frame_log_checked_)) {
+      frame_log_checked_ = true;
+      if (const char *prefix = std::getenv("DXMT_FRAME_LOG")) {
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s-%d.csv", prefix, (int)getpid());
+        frame_log_ = std::fopen(path, "w");
+        if (frame_log_) {
+          std::setvbuf(frame_log_, nullptr, _IOFBF, 1 << 20);
+          std::fputs("frame,dt_us,commit_us,prep_us,flush_us,block_us,latwait_us,cmdbufs,compiles\n", frame_log_);
+        }
+      }
+    }
+    if (likely(!frame_log_))
+      return;
+    auto now = clock::now();
+    if (frame_log_last_.time_since_epoch().count() != 0 && frame_count >= 2) {
+      auto us = [](clock::duration d) {
+        return (long)std::chrono::duration_cast<std::chrono::microseconds>(d).count();
+      };
+      // frame_count-2: fully encoded and presented by now (encode runs async)
+      auto &f = statistics.at(frame_count - 2);
+      uint64_t compiles_total = g_compiled_shader_variants.load(std::memory_order_relaxed);
+      std::fprintf(
+          frame_log_, "%llu,%ld,%ld,%ld,%ld,%ld,%ld,%u,%llu\n", frame_count - 2,
+          us(now - frame_log_last_), us(f.commit_interval), us(f.encode_prepare_interval),
+          us(f.encode_flush_interval), us(f.drawable_blocking_interval), us(f.present_latency_interval),
+          f.command_buffer_count, compiles_total - frame_log_compiles_);
+      frame_log_compiles_ = compiles_total;
+      if ((frame_count & 0xff) == 0)
+        std::fflush(frame_log_);
+    }
+    frame_log_last_ = now;
   }
 
   uint32_t GetMaxLatency() { return max_latency_; }

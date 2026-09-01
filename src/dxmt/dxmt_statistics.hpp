@@ -2,11 +2,16 @@
 
 #include "util_flags.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 
 namespace dxmt {
 
 using clock = std::chrono::high_resolution_clock;
+
+// Total shader variants actually compiled (pipeline cache misses).
+// Sampled per-frame by the DXMT_FRAME_LOG logger to attribute hitches.
+inline std::atomic_uint64_t g_compiled_shader_variants{0};
 
 enum class FeatureCompatibility {
     UnsupportedGeometryDraw,
