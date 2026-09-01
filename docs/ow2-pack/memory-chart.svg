@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="240" viewBox="0 0 640 240" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
+  <style>
+    .lbl { fill: #8b949e; }
+    .val { fill: #8b949e; font-weight: bold; }
+    .before { fill: #d73a49; opacity: 0.85; }
+    .after { fill: #2ea043; opacity: 0.9; }
+    .title { fill: #8b949e; font-size: 15px; font-weight: bold; }
+  </style>
+  <text x="20" y="26" class="title">Overwatch 2 under CrossOver, 16 GB M1 Pro — before / after d3d11.releaseShaderIR</text>
+
+  <text x="20" y="62" class="lbl">Process footprint</text>
+  <rect x="200" y="48" width="390" height="18" rx="3" class="before"/>
+  <text x="596" y="62" class="val">13.0 GB</text>
+  <rect x="200" y="72" width="117" height="18" rx="3" class="after"/>
+  <text x="325" y="86" class="val">3.9 GB</text>
+
+  <text x="20" y="132" class="lbl">Shader IR heap</text>
+  <text x="20" y="148" class="lbl">(MALLOC_SMALL)</text>
+  <rect x="200" y="118" width="390" height="18" rx="3" class="before"/>
+  <text x="596" y="132" class="val">9.4 GB</text>
+  <rect x="200" y="142" width="6" height="18" rx="2" class="after"/>
+  <text x="214" y="156" class="val">0.1 GB</text>
+
+  <text x="20" y="200" class="lbl">Killcam / respawn FPS (swap-induced stutter)</text>
+  <rect x="380" y="186" width="88" height="18" rx="3" class="before"/>
+  <text x="474" y="200" class="val">22–28 fps</text>
+  <rect x="380" y="210" width="235" height="18" rx="3" class="after"/>
+  <text x="530" y="224" class="val" fill="#fff">59.9 fps</text>
+</svg>
