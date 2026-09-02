@@ -36,16 +36,53 @@ cp "$HERE"/i386-windows/*   "$CX_LIB/i386-windows/"
 cp "$HERE"/x86_64-windows/* "$CX_LIB/x86_64-windows/"
 cp "$HERE"/x86_64-unix/winemetal.so "$CX_LIB/x86_64-unix/"
 
-bold "Done. Next steps:"
-cat <<'EOF'
-1. Copy dxmt.conf.example somewhere, e.g.:  cp dxmt.conf.example ~/dxmt.conf
-2. In your bottle's cxbottle.conf, [EnvironmentVariables] section, ensure:
-     "CX_GRAPHICS_BACKEND" = "dxmt"
-     "DXMT_USE_DEFAULT_METAL_CACHE" = "1"
-     "DXMT_CONFIG_FILE" = "/Users/YOU/dxmt.conf"
-3. Fully restart Battle.net (env vars are read at bottle start).
-4. In game: DirectX 11, uncap in-game FPS (e.g. 120/300); pacing comes from the config.
+# ---- bottle setup (optional, interactive) ----
+BOTTLES_DIR="$HOME/Library/Application Support/CrossOver/Bottles"
+CONF_DST="$HOME/dxmt.conf"
 
-NOTE: a CrossOver update overwrites these files — just run install.sh again.
-Rollback anytime: ./uninstall.sh
+if [ ! -f "$CONF_DST" ]; then
+  cp "$HERE/dxmt.conf.example" "$CONF_DST"
+  echo "Config installed: $CONF_DST"
+else
+  echo "Config already exists: $CONF_DST (keeping yours)"
+fi
+
+shopt -s nullglob
+BOTTLES=("$BOTTLES_DIR"/*/cxbottle.conf)
+if [ ${#BOTTLES[@]} -gt 0 ]; then
+  bold "Set up a bottle to use DXMT + this config?"
+  i=1
+  for b in "${BOTTLES[@]}"; do
+    echo "  $i) $(basename "$(dirname "$b")")"
+    i=$((i+1))
+  done
+  echo "  0) skip (set env vars manually)"
+  printf "Choice: "; read -r CH
+  if [ "${CH:-0}" -ge 1 ] 2>/dev/null && [ "$CH" -le "${#BOTTLES[@]}" ]; then
+    BC="${BOTTLES[$((CH-1))]}"
+    cp "$BC" "$BC.bak-dxmt"
+    add_env() { # append key to [EnvironmentVariables] only if missing
+      grep -q "^\"$1\"" "$BC" || printf '"%s" = "%s"\n' "$1" "$2" >> "$BC"
+    }
+    grep -q '^\[EnvironmentVariables\]' "$BC" || printf '\n[EnvironmentVariables]\n' >> "$BC"
+    add_env CX_GRAPHICS_BACKEND dxmt
+    add_env DXMT_USE_DEFAULT_METAL_CACHE 1
+    add_env DXMT_CONFIG_FILE "$CONF_DST"
+    echo "Bottle configured: $(basename "$(dirname "$BC")") (backup: cxbottle.conf.bak-dxmt)"
+  else
+    echo "Skipped bottle setup."
+  fi
+fi
+
+bold "Done. Final steps:"
+cat <<'EOF'
+1. Fully restart Battle.net (env vars are read when the bottle starts).
+2. In game: DirectX 11, uncap the in-game FPS limit (e.g. 120/300) —
+   the config paces frames to a flat 60.
+
+First days: the shader cache starts empty. New heroes/skins/maps compile once
+(a brief hitch) and are cached forever — it gets smoother the more you play.
+
+NOTE: a CrossOver update overwrites the installed libs — just run install.sh again.
+Rollback anytime: bash uninstall.sh
 EOF

@@ -21,8 +21,8 @@ DXMT itself goes to upstream — this fork adds targeted fixes and tooling on to
   [releases](../../releases)): frame pacing via `d3d11.preferredMaxFrameRate`, optional
   MetalFX spatial output upscaling.
 
-**Quick start:** grab the latest [release](../../releases), unpack, `./install.sh`.
-It backs up the stock CrossOver DXMT first; `./uninstall.sh` restores it.
+**Quick start:** grab the latest [release](../../releases), unpack, `bash install.sh` (see [the 5-minute guide](docs/ow2-pack/INSTALL.md)).
+It backs up the stock CrossOver DXMT first; `bash uninstall.sh` restores it.
 
 **Shader cache expectations:** the persistent cache starts empty and fills as you play.
 Every new hero, skin, ability effect, and map introduces shader variants that compile once
