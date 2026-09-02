@@ -47,3 +47,9 @@ The most recent development builds can be found [here](https://github.com/3Shain
 ## Build
 
 See [DEVELOPMENT.md](docs/DEVELOPMENT.md)
+
+---
+
+*If this fork saved your ranked games, you can [sponsor my work](https://github.com/sponsors/NerRobDog) —
+it supports the packaging and investigation effort here, not DXMT itself.
+Star [3Shain/dxmt](https://github.com/3Shain/dxmt) too — that's where the heavy lifting lives.*
