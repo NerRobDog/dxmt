@@ -117,6 +117,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::deque<Submission> worker_queue_;
   bool worker_stop_ = false;
   dxmt::thread encode_worker_thread_;
+  // Presents queued or being encoded on the worker but not yet committed.
+  // Present() blocks while this reaches max_pending_presents_, so a paced
+  // (or slow) present path pushes back on the app's render thread instead
+  // of buffering unbounded latency in worker_queue_.
+  std::atomic<uint32_t> pending_presents_{0};
+  uint32_t max_pending_presents_ = 2;
 
   void
   CommandBufferWaitingThread() {
@@ -415,6 +421,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       else
         cmdbuf.presentDrawable(drawable);
       scope.inflight.semaphore = sub.semaphore;
+      pending_presents_.fetch_sub(1, std::memory_order_release);
+      pending_presents_.notify_all();
       break;
     }
     }
@@ -442,6 +450,11 @@ public:
       MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice),
       inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }) {
     sync_encode_ = env::getEnvVar("DXMT_D3D12_SYNC_ENCODE") == "1";
+    if (auto v = env::getEnvVar("DXMT_D3D12_MAX_PENDING_PRESENTS"); !v.empty()) {
+      int parsed = atoi(v.c_str());
+      if (parsed >= 1 && parsed <= 16)
+        max_pending_presents_ = parsed;
+    }
     if (!sync_encode_)
       encode_worker_thread_ = dxmt::thread([this]() { this->EncodeWorkerThread(); });
   }
@@ -608,6 +621,14 @@ public:
     sub.upscaled = pUpscaled;
     sub.semaphore = hLantecyWaitable;
     sub.present_after = after;
+
+    uint32_t pending = pending_presents_.load(std::memory_order_acquire);
+    while (pending >= max_pending_presents_) {
+      pending_presents_.wait(pending, std::memory_order_acquire);
+      pending = pending_presents_.load(std::memory_order_acquire);
+    }
+    pending_presents_.fetch_add(1, std::memory_order_release);
+
     uint64_t qdepth = EnqueueSubmission(std::move(sub));
 
     FrameLogTick(qdepth);
