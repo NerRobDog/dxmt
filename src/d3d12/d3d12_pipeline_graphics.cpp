@@ -396,18 +396,32 @@ public:
       return E_NOTIMPL;
     }
 
+    HRESULT hr;
+    sm50_error_t sm50_err;
+
+    // A pass-through GS (only forwards RT array / viewport index) is folded
+    // into the vertex shader; a real GS would need the mesh-pipeline path the
+    // d3d11 side uses, which is not wired up here yet.
+    uint32_t gs_passthrough = ~0u;
     if (pDesc->GS.pShaderBytecode) {
-      ERR("CreatePipelineState: GS not supported");
-      return E_NOTIMPL;
+      sm50_shader_t shader_gs = nullptr;
+      MTL_SHADER_REFLECTION ref_gs;
+      if (SM50Initialize(pDesc->GS.pShaderBytecode, pDesc->GS.BytecodeLength, &shader_gs, &ref_gs, &sm50_err)) {
+        ERR("CreatePipelineState: failed to parse gs shader");
+        return E_FAIL;
+      }
+      gs_passthrough = ref_gs.GeometryShader.GSPassThrough;
+      SM50Destroy(shader_gs);
+      if (gs_passthrough == ~0u) {
+        ERR("CreatePipelineState: non-passthrough GS not supported (primitive ", ref_gs.GeometryShader.Primitive, ")");
+        return E_NOTIMPL;
+      }
     }
 
     if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode) {
       ERR("CreatePipelineState: Tess not supported");
       return E_NOTIMPL;
     }
-
-    HRESULT hr;
-    sm50_error_t sm50_err;
     auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> err;
     WMT::Reference<WMT::Function> vs_func, ps_func;
@@ -443,6 +457,12 @@ public:
       data_ia_layout.slot_mask = slot_mask;
       data_ia_layout.next = &common;
 
+      SM50_SHADER_GS_PASS_THROUGH_DATA data_gs_passthrough;
+      data_gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
+      data_gs_passthrough.DataEncoded = gs_passthrough;
+      data_gs_passthrough.RasterizationDisabled = false;
+      data_gs_passthrough.next = &data_ia_layout;
+
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig;
       rootsig.type = SM50_SHADER_ROOT_SIGNATURE;
       if (pDesc->pRootSignature) {
@@ -452,12 +472,13 @@ public:
         rootsig.bytecode = pDesc->VS.pShaderBytecode;
         rootsig.bytecode_length = pDesc->VS.BytecodeLength;
       }
-      rootsig.next = &data_ia_layout;
+      rootsig.next = gs_passthrough != ~0u ? (void *)&data_gs_passthrough : (void *)&data_ia_layout;
 
       // disk cache key: (dxbc sha1, variant sha1 over everything SM50Compile sees)
       Sha1Digest vs_sha1 = Sha1HashState::compute(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
       Sha1HashState vs_vh;
       vs_vh.update((uint32_t)common.metal_version);
+      vs_vh.update(gs_passthrough);
       vs_vh.update(data_ia_layout.index_buffer_format);
       vs_vh.update(data_ia_layout.slot_mask);
       vs_vh.update(data_ia_layout.num_elements);
