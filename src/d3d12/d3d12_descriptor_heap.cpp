@@ -103,7 +103,8 @@ public:
 
       Flags<BufferAllocationFlag> flags;
 #ifdef __i386__
-      IMPLEMENT_ME
+      // 32-bit: keep the mapping inside the 32-bit address space (same as d3d11)
+      flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
       buffer_->rename(buffer_->allocate(flags));
       mapped_argument_buffer_ =
@@ -487,7 +488,8 @@ public:
 
       Flags<BufferAllocationFlag> flags;
 #ifdef __i386__
-      IMPLEMENT_ME
+      // 32-bit: keep the mapping inside the 32-bit address space (same as d3d11)
+      flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
       buffer_->rename(buffer_->allocate(flags));
       mapped_argument_buffer_ = reinterpret_cast<SamplerGPUStorage *>(buffer_->current()->mappedMemory(0));

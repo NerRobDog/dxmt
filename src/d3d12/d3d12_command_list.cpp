@@ -248,7 +248,56 @@ public:
     return Initialize(pAllocator, pInitialState);
   };
 
-  void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pPipelineState) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  ClearState(ID3D12PipelineState *pPipelineState) {
+    // reset all tracked state to command-list defaults (same defaults as Initialize)
+    pso_graphics_ = nullptr;
+    pso_compute_ = nullptr;
+    if (auto pso = static_cast<MTLD3D12PipelineState *>(pPipelineState)) {
+      if (!pso->IsComputePipelineState)
+        pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pPipelineState);
+      else
+        pso_compute_ = static_cast<MTLD3D12ComputePipelineState *>(pPipelineState);
+    }
+
+    num_rtvs = {};
+    memset(rtvs, 0, sizeof(rtvs));
+    dsv = {};
+
+    topology_ = {};
+
+    num_viewports = {};
+    memset(viewports, 0, sizeof(viewports));
+
+    num_scissors = {};
+    memset(scissors, 0, sizeof(scissors));
+
+    blend_factor_[0] = 1.0f;
+    blend_factor_[1] = 1.0f;
+    blend_factor_[2] = 1.0f;
+    blend_factor_[3] = 1.0f;
+    stencil_ref_ = 0;
+
+    rootsig_graphics_ = nullptr;
+    memset(rootarg_graphics_staging_, 0, sizeof(rootarg_graphics_staging_));
+
+    rootsig_compute_ = nullptr;
+    memset(rootarg_compute_staging_, 0, sizeof(rootarg_compute_staging_));
+
+    memset(vertex_buffers_.data(), 0, sizeof(vertex_buffers_));
+
+    index_buffer_address = 0;
+    index_buffer = {};
+    index_type = {};
+    index_offset = 0;
+
+    dirty_state_.set(
+        DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature,
+        DirtyState::Viewport, DirtyState::ScissorRect, DirtyState::ComputeRootArguments,
+        DirtyState::ComputeRootSignature, DirtyState::BlendFactor, DirtyState::StencilRef,
+        DirtyState::GraphicsPipelineState, DirtyState::ComputePipelineState
+    );
+  };
 
   std::tuple<uint64_t, uint64_t>
   PopulateVertexBufferTable(uint32_t Count) {
@@ -835,8 +884,10 @@ public:
                              ? (src_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
                              : WMTBlitOptionNone;
       } else {
-        // so it is buffer to buffer copy?
-        IMPLEMENT_ME
+        // buffer-to-buffer via CopyTextureRegion is invalid per D3D12 spec: skip the copy
+        static bool warned = false;
+        if (!std::exchange(warned, true))
+          WARN("CopyTextureRegion: invalid buffer-to-buffer copy (both locations PLACED_FOOTPRINT), ignored");
       }
     }
   };
@@ -884,7 +935,11 @@ public:
       const D3D12_TILE_REGION_SIZE *tile_region_size, ID3D12Resource *buffer, UINT64 buffer_offset,
       D3D12_TILE_COPY_FLAGS flags
   ) {
-    IMPLEMENT_ME
+    // tiled resources are emulated as fully-resident committed ones (see
+    // CreateReservedResource); tile-granular copies are dropped, data stays stale
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("CopyTiles: ignored (tiled resources not supported)");
   };
 
   void STDMETHODCALLTYPE ResolveSubresource(
@@ -1018,7 +1073,13 @@ public:
     // optimization hints later)
   };
 
-  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  ExecuteBundle(ID3D12GraphicsCommandList *CommandList) {
+    // bundles are unsupported: the bundle's recorded work is dropped entirely
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("ExecuteBundle: ignored (bundles not supported)");
+  };
 
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
     // no need to do anything here because because we encode the full descriptor table address in root argument
@@ -1202,7 +1263,10 @@ public:
   };
 
   void STDMETHODCALLTYPE SOSetTargets(UINT StartSlot, UINT Count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *Views) {
-    IMPLEMENT_ME
+    // stream output unsupported: SO buffers will never be written
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("SOSetTargets: ignored (stream output not supported), StartSlot=", StartSlot, " Count=", Count);
   };
 
   void STDMETHODCALLTYPE
@@ -1413,14 +1477,18 @@ public:
   };
 
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
-    IMPLEMENT_ME
+    // predication ignored: predicated commands always execute (conservative but visible)
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("SetPredication: ignored, predicated commands always execute");
   };
 
-  void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) { IMPLEMENT_ME };
+  // PIX debug markers/events: pure no-ops, nothing to annotate
+  void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {};
 
-  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {};
 
-  void STDMETHODCALLTYPE EndEvent() { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE EndEvent() {};
 
   void STDMETHODCALLTYPE ExecuteIndirect(
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
@@ -1464,7 +1532,12 @@ public:
     if (status == DrawCallStatus::Invalid)
       return;
     if (status != DrawCallStatus::Ordinary) {
-      IMPLEMENT_ME // TODO: (potential) emulated pipeline
+      // TODO: (potential) emulated pipeline; encoding it as ordinary would run the
+      // wrong pipeline, so skip the indirect draw instead
+      static bool warned = false;
+      if (!std::exchange(warned, true))
+        WARN("ExecuteIndirect: skipping indirect draw on emulated pipeline (not supported)");
+      return;
     }
 
     auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), MaxCommandCount);
@@ -1490,7 +1563,12 @@ public:
       ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT Dependencies,
       ID3D12Resource *const *ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64 *pDependentSubresourceRanges
   ) {
-    IMPLEMENT_ME
+    // approximated as a plain 4-byte blit copy: atomicity and dependency ranges ignored
+    // (commands within one command list execute in order anyway)
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("AtomicCopyBufferUINT: approximated as ordinary copy, dependencies ignored");
+    CopyBufferRegion(pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, sizeof(UINT));
   }
 
   void STDMETHODCALLTYPE
@@ -1498,7 +1576,11 @@ public:
       ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT Dependencies,
       ID3D12Resource *const *ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64 *pDependentSubresourceRanges
   ) {
-    IMPLEMENT_ME
+    // approximated as a plain 8-byte blit copy: atomicity and dependency ranges ignored
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("AtomicCopyBufferUINT64: approximated as ordinary copy, dependencies ignored");
+    CopyBufferRegion(pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, sizeof(UINT64));
   }
 
   void STDMETHODCALLTYPE
@@ -1508,7 +1590,10 @@ public:
 
   void STDMETHODCALLTYPE
   SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION *pSamplePositions) {
-    IMPLEMENT_ME
+    // programmable sample positions unsupported: default positions are used instead
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("SetSamplePositions: ignored, default sample positions are used");
   }
 
   void STDMETHODCALLTYPE
@@ -1516,19 +1601,31 @@ public:
       ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
       UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode
   ) {
-    IMPLEMENT_ME
+    // approximated as a full-subresource resolve: source rect, destination offset
+    // and resolve mode are ignored (same approach as rect-bounded clears)
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("ResolveSubresourceRegion: approximated as full-subresource resolve (mode ", (UINT)ResolveMode, ")");
+    ResolveSubresource(pDstResource, DstSubresource, pSrcResource, SrcSubresource, Format);
   }
 
   void STDMETHODCALLTYPE
   SetViewInstanceMask(UINT Mask) {
-    IMPLEMENT_ME
+    // view instancing unsupported (and never reported as supported): ignore the mask
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("SetViewInstanceMask: ignored (view instancing not supported), Mask=", Mask);
   }
 
   void STDMETHODCALLTYPE
   WriteBufferImmediate(
       UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE *pModes
   ) {
-    IMPLEMENT_ME
+    // GPU-timeline immediate writes dropped: mostly used for breadcrumb debugging;
+    // buffers keep their previous contents
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("WriteBufferImmediate: ignored (", Count, " writes dropped)");
   }
 };
 

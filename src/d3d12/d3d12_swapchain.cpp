@@ -140,6 +140,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   Rc<Presenter> presenter;
   uint32_t frame_latency;
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+  DXGI_RGBA background_color_ = {0.0f, 0.0f, 0.0f, 1.0f};
   float scale_factor = 1.0;
   HUDState hud;
   double init_refresh_rate_ = DBL_MAX;
@@ -724,42 +725,77 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetRestrictToOutput(IDXGIOutput **ppRestrictToOutput) final {
-    IMPLEMENT_ME;
+    // output restriction is never set on this swapchain
+    if (!ppRestrictToOutput)
+      return E_INVALIDARG;
+    *ppRestrictToOutput = nullptr;
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("D3D12SwapChain::GetRestrictToOutput: not supported");
+    return E_NOTIMPL;
   };
 
   HRESULT
   STDMETHODCALLTYPE
   SetBackgroundColor(const DXGI_RGBA *pColor) final {
-    IMPLEMENT_ME;
+    // stored for GetBackgroundColor round-trip only; has no visual effect
+    if (!pColor)
+      return E_INVALIDARG;
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("D3D12SwapChain::SetBackgroundColor: stored but ignored for presentation");
+    background_color_ = *pColor;
+    return S_OK;
   };
 
   HRESULT
   STDMETHODCALLTYPE
   GetBackgroundColor(DXGI_RGBA *pColor) final {
-    IMPLEMENT_ME;
+    if (!pColor)
+      return E_INVALIDARG;
+    *pColor = background_color_;
+    return S_OK;
   };
 
   HRESULT
   STDMETHODCALLTYPE
   SetRotation(DXGI_MODE_ROTATION Rotation) final {
-    IMPLEMENT_ME;
+    // rotated presentation not supported; identity is a no-op anyway
+    if (Rotation == DXGI_MODE_ROTATION_IDENTITY || Rotation == DXGI_MODE_ROTATION_UNSPECIFIED)
+      return S_OK;
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("D3D12SwapChain::SetRotation: rotation ", (UINT)Rotation, " not supported");
+    return DXGI_ERROR_INVALID_CALL;
   };
 
   HRESULT
   STDMETHODCALLTYPE
   GetRotation(DXGI_MODE_ROTATION *pRotation) final {
-    IMPLEMENT_ME;
+    if (!pRotation)
+      return E_INVALIDARG;
+    *pRotation = DXGI_MODE_ROTATION_IDENTITY;
+    return S_OK;
   };
 
   HRESULT STDMETHODCALLTYPE
   SetSourceSize(UINT width, UINT height) override {
-    IMPLEMENT_ME
+    // partial-backbuffer presentation ignored: the full backbuffer is presented
+    if (width == 0 || height == 0 || width > desc_.Width || height > desc_.Height)
+      return E_INVALIDARG;
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("D3D12SwapChain::SetSourceSize: ignored (", width, "x", height, ")");
     return S_OK;
   };
 
   HRESULT STDMETHODCALLTYPE
   GetSourceSize(UINT *width, UINT *height) override {
-    IMPLEMENT_ME
+    // SetSourceSize is ignored, so the source region is always the full backbuffer
+    if (!width || !height)
+      return E_INVALIDARG;
+    *width = desc_.Width;
+    *height = desc_.Height;
     return S_OK;
   };
 

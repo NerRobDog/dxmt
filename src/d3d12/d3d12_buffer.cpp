@@ -235,21 +235,40 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   CreateRenderTargetView(const D3D12_RENDER_TARGET_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
-    IMPLEMENT_ME
-    return S_OK;
+    // buffer RTVs (D3D12_RTV_DIMENSION_BUFFER) not supported: descriptor is left unwritten
+    ERR("D3D12Buffer::CreateRenderTargetView: buffer render target views are not implemented");
+    return E_NOTIMPL;
   };
 
   virtual HRESULT STDMETHODCALLTYPE
   CreateDepthStencilView(const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
-    IMPLEMENT_ME
-    return S_OK;
+    // DSV on a buffer is invalid per D3D12 spec: refuse instead of aborting
+    ERR("D3D12Buffer::CreateDepthStencilView: depth-stencil views on buffers are invalid");
+    return E_INVALIDARG;
   };
 
   virtual void STDMETHODCALLTYPE GetResourceTiling(
       UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTitleShape,
       UINT *SubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *SubresourceTilings
   ) {
-    IMPLEMENT_ME
+    // spec-shaped 64KB buffer tiling; the device-level GetResourceTiling has the
+    // canonical implementation, this per-resource entry point mirrors it for buffers
+    UINT total_tiles = (UINT)((desc_.Width + D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES - 1) /
+                              D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+    if (TotalTileCount)
+      *TotalTileCount = total_tiles;
+    if (PackedMipInfo)
+      *PackedMipInfo = {1, 0, 0, 0};
+    if (StandardTitleShape)
+      *StandardTitleShape = {D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES, 1, 1};
+    if (SubresourceTilingCount && SubresourceTilings) {
+      if (*SubresourceTilingCount > 0 && FirstSubresourceTiling == 0) {
+        SubresourceTilings[0] = {total_tiles, 1, 1, 0};
+        *SubresourceTilingCount = 1;
+      } else {
+        *SubresourceTilingCount = 0;
+      }
+    }
   };
 };
 

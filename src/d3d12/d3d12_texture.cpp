@@ -659,8 +659,11 @@ public:
       break;
     }
     case D3D12_RTV_DIMENSION_TEXTURE2D: {
-      if (ViewDesc.Texture2D.PlaneSlice)
-        IMPLEMENT_ME
+      if (ViewDesc.Texture2D.PlaneSlice) {
+        // rendering to a non-zero plane (e.g. stencil plane) unimplemented; refuse
+        ERR("D3D12Texture::CreateRenderTargetView: unsupported PlaneSlice ", ViewDesc.Texture2D.PlaneSlice);
+        return E_NOTIMPL;
+      }
       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MipSlice;
       view_descriptor.miplevelCount = 1;
@@ -670,8 +673,11 @@ public:
       break;
     }
     case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: {
-      if (ViewDesc.Texture2DArray.PlaneSlice)
-        IMPLEMENT_ME
+      if (ViewDesc.Texture2DArray.PlaneSlice) {
+        // rendering to a non-zero plane (e.g. stencil plane) unimplemented; refuse
+        ERR("D3D12Texture::CreateRenderTargetView: unsupported PlaneSlice ", ViewDesc.Texture2DArray.PlaneSlice);
+        return E_NOTIMPL;
+      }
       view_descriptor.type = WMTTextureType2DArray;
       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MipSlice;
       view_descriptor.miplevelCount = 1;
@@ -832,7 +838,19 @@ public:
       UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTitleShape,
       UINT *SubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *SubresourceTilings
   ) {
-    IMPLEMENT_ME
+    // zero-fill: the canonical tiling math lives in ID3D12Device::GetResourceTiling,
+    // which does not route through this per-resource entry point
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("D3D12Texture::GetResourceTiling: returning empty tiling info");
+    if (TotalTileCount)
+      *TotalTileCount = 0;
+    if (PackedMipInfo)
+      *PackedMipInfo = {};
+    if (StandardTitleShape)
+      *StandardTitleShape = {};
+    if (SubresourceTilingCount)
+      *SubresourceTilingCount = 0;
   };
 };
 

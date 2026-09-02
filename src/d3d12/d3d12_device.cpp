@@ -703,8 +703,12 @@ public:
         } else {
           PlaneFormats[0] = pDesc->Format;
           PlaneBytesPerTexel[0] = FormatDesc.BytesPerTexel;
-          if (PlaneBytesPerTexel[0] == 0)
-            IMPLEMENT_ME
+          if (PlaneBytesPerTexel[0] == 0) {
+            // no linear layout known for this format: report the spec's
+            // "invalid" sentinel footprints (~0) instead of aborting
+            WARN("GetCopyableFootprints: unhandled format ", pDesc->Format, " (no texel size)");
+            break;
+          }
         }
       }
 

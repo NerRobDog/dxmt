@@ -643,7 +643,12 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   GetCachedBlob(ID3DBlob **blob) {
-    IMPLEMENT_ME
+    // PSO caching blob not supported: report honestly, caller falls back to full compile
+    if (blob)
+      *blob = nullptr;
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("D3D12GraphicsPipelineState::GetCachedBlob: not supported, returning E_NOTIMPL");
     return E_NOTIMPL;
   }
 };
