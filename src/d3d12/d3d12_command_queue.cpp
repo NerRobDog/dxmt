@@ -60,6 +60,14 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::chrono::steady_clock::time_point frame_log_last_{};
   uint64_t frame_log_frame_ = 0;
   uint64_t frame_log_compiles_ = 0;
+  uint64_t frame_log_encode_us_ = 0;
+  uint64_t frame_log_submits_ = 0;
+  uint64_t frame_log_encoders_ = 0;
+
+  // cumulative ExecuteCommandLists stats (any thread)
+  std::atomic_uint64_t stat_encode_us_{0};
+  std::atomic_uint64_t stat_submits_{0};
+  std::atomic_uint64_t stat_encoders_{0};
 
   dxmt::mutex mutex_commit_;
 
@@ -199,12 +207,15 @@ public:
 
   void STDMETHODCALLTYPE
   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
+    auto stat_t0 = std::chrono::steady_clock::now();
+    uint64_t stat_encoders = 0;
     auto scope = StartCommitting();
     auto &cmdbuf = scope.inflight.cmdbuf;
     for (unsigned i = 0; i < Count; i++) {
       auto pCommandList = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
       EncoderData *current = pCommandList->entry;
       while (current) {
+        stat_encoders++;
         switch (current->type) {
         case EncoderType::Null:
           break;
@@ -342,6 +353,11 @@ public:
         current = current->next;
       }
     }
+    stat_encoders_.fetch_add(stat_encoders, std::memory_order_relaxed);
+    stat_submits_.fetch_add(1, std::memory_order_relaxed);
+    stat_encode_us_.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - stat_t0).count(),
+        std::memory_order_relaxed);
   };
 
   void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) {};
@@ -432,7 +448,7 @@ public:
         frame_log_ = std::fopen(path, "w");
         if (frame_log_) {
           std::setvbuf(frame_log_, nullptr, _IOFBF, 1 << 20);
-          std::fputs("frame,dt_us,inflight,compiles\n", frame_log_);
+          std::fputs("frame,dt_us,inflight,compiles,encode_us,submits,encoders\n", frame_log_);
         }
       }
     }
@@ -442,11 +458,20 @@ public:
     if (frame_log_frame_ > 0) {
       long dt_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(now - frame_log_last_).count();
       uint64_t compiles_total = g_compiled_shader_variants.load(std::memory_order_relaxed);
+      uint64_t encode_total = stat_encode_us_.load(std::memory_order_relaxed);
+      uint64_t submits_total = stat_submits_.load(std::memory_order_relaxed);
+      uint64_t encoders_total = stat_encoders_.load(std::memory_order_relaxed);
       std::fprintf(
-          frame_log_, "%llu,%ld,%llu,%llu\n", (unsigned long long)frame_log_frame_, dt_us,
+          frame_log_, "%llu,%ld,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)frame_log_frame_, dt_us,
           (unsigned long long)inflight_cmdbuf_count_.load(std::memory_order_relaxed),
-          (unsigned long long)(compiles_total - frame_log_compiles_));
+          (unsigned long long)(compiles_total - frame_log_compiles_),
+          (unsigned long long)(encode_total - frame_log_encode_us_),
+          (unsigned long long)(submits_total - frame_log_submits_),
+          (unsigned long long)(encoders_total - frame_log_encoders_));
       frame_log_compiles_ = compiles_total;
+      frame_log_encode_us_ = encode_total;
+      frame_log_submits_ = submits_total;
+      frame_log_encoders_ = encoders_total;
       if ((frame_log_frame_ & 0xff) == 0)
         std::fflush(frame_log_);
     } else {
