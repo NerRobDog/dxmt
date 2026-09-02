@@ -181,7 +181,10 @@ public:
       const D3D12_TILE_RANGE_FLAGS *range_flags, const UINT *heap_range_offsets, const UINT *range_tile_counts,
       D3D12_TILE_MAPPING_FLAGS flags
   ) {
-    IMPLEMENT_ME
+    // tiled resources unsupported; see GetResourceTiling
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("UpdateTileMappings: ignored (tiled resources not supported)");
   };
 
   void STDMETHODCALLTYPE CopyTileMappings(
@@ -189,7 +192,9 @@ public:
       ID3D12Resource *src_resource, const D3D12_TILED_RESOURCE_COORDINATE *src_region_start_coordinate,
       const D3D12_TILE_REGION_SIZE *region_size, D3D12_TILE_MAPPING_FLAGS flags
   ) {
-    IMPLEMENT_ME
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      WARN("CopyTileMappings: ignored (tiled resources not supported)");
   };
 
   void STDMETHODCALLTYPE

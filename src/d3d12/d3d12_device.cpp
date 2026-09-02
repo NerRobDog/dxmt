@@ -608,7 +608,19 @@ public:
       const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
       const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **resource
   ) {
-    return E_NOTIMPL;
+    // No sparse backing: emulate a reserved resource as a fully resident
+    // committed one. UpdateTileMappings is a no-op, so every tile is always
+    // mapped; costs memory but keeps tier-probing titles alive.
+    WARN(
+        "CreateReservedResource: emulating as committed (dim ", (UINT)pDesc->Dimension, " ", pDesc->Width, "x",
+        pDesc->Height, " mips ", pDesc->MipLevels, " format ", (UINT)pDesc->Format, ")"
+    );
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = *pDesc; // reserved descs carry 64KB_UNDEFINED_SWIZZLE
+    desc.Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, InitialState, OptimizedClearValue, riid, resource);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -781,7 +793,98 @@ public:
       D3D12_TILE_SHAPE *StandardTileShape, UINT *SubresourceTilingCount, UINT FirstSubresourceTiling,
       D3D12_SUBRESOURCE_TILING *SubresourceTilings
   ) {
-    IMPLEMENT_ME
+    // Tiled resources are not supported (TiledResourcesTier = NOT_SUPPORTED), but
+    // some titles probe this unconditionally. Answer with spec-shaped 64KB tiling
+    // instead of aborting; tile mappings themselves remain no-ops.
+    D3D12_RESOURCE_DESC desc = pResource->GetDesc();
+
+    UINT tile_w = 128, tile_h = 128, tile_d = 1; // texels per 64KB tile
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      tile_w = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+      tile_h = 1;
+    } else {
+      MTL_DXGI_FORMAT_DESC format_desc = {};
+      MTLQueryDXGIFormat(GetMTLDevice(), desc.Format, format_desc);
+      UINT bytes = format_desc.BytesPerTexel ? format_desc.BytesPerTexel : 4;
+      if (format_desc.Flag & MTL_DXGI_FORMAT_BC) {
+        // bytes is per 4x4 block: BC1/BC4 (8B) -> 512x256 texels, the rest (16B) -> 256x256
+        tile_w = bytes == 8 ? 512 : 256;
+        tile_h = 256;
+      } else {
+        switch (bytes) {
+        case 1: tile_w = 256; tile_h = 256; break;
+        case 2: tile_w = 256; tile_h = 128; break;
+        case 4: tile_w = 128; tile_h = 128; break;
+        case 8: tile_w = 128; tile_h = 64; break;
+        default: tile_w = 64; tile_h = 64; break;
+        }
+      }
+    }
+
+    UINT16 mip_count = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : std::max<UINT16>(desc.MipLevels, 1);
+    UINT array_size =
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : std::max<UINT>(desc.DepthOrArraySize, 1);
+
+    // per-mip standard tiling; mips smaller than one tile are packed
+    UINT num_standard_mips = 0;
+    UINT tiles_per_slice = 0; // standard tiles in one array slice
+    struct MipTiling {
+      UINT w, h, d, start;
+    };
+    MipTiling mips[16] = {};
+    for (UINT16 m = 0; m < mip_count && m < 16; m++) {
+      UINT64 mw = std::max<UINT64>(desc.Width >> m, 1);
+      UINT mh = std::max<UINT>(desc.Height >> m, 1);
+      UINT md = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                    ? std::max<UINT>(desc.DepthOrArraySize >> m, 1)
+                    : 1;
+      if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (mw < tile_w && mh < tile_h) && m > 0)
+        break; // this and all smaller mips are packed
+      mips[m].w = (UINT)((mw + tile_w - 1) / tile_w);
+      mips[m].h = (mh + tile_h - 1) / tile_h;
+      mips[m].d = (md + tile_d - 1) / tile_d;
+      mips[m].start = tiles_per_slice;
+      tiles_per_slice += mips[m].w * mips[m].h * mips[m].d;
+      num_standard_mips++;
+    }
+    UINT num_packed_mips = mip_count - num_standard_mips;
+    UINT packed_tiles = num_packed_mips ? 1 : 0;
+    UINT tiles_per_full_slice = tiles_per_slice + packed_tiles;
+
+    if (TotalTileCount)
+      *TotalTileCount = tiles_per_full_slice * array_size;
+    if (PackedMipInfo) {
+      PackedMipInfo->NumStandardMips = (UINT8)num_standard_mips;
+      PackedMipInfo->NumPackedMips = (UINT8)num_packed_mips;
+      PackedMipInfo->NumTilesForPackedMips = packed_tiles;
+      PackedMipInfo->StartTileIndexInOverallResource = num_packed_mips ? tiles_per_slice : 0;
+    }
+    if (StandardTileShape) {
+      StandardTileShape->WidthInTexels = tile_w;
+      StandardTileShape->HeightInTexels = tile_h;
+      StandardTileShape->DepthInTexels = tile_d;
+    }
+    if (SubresourceTilingCount && SubresourceTilings) {
+      UINT total_subresources = mip_count * array_size;
+      UINT count = 0;
+      for (UINT s = FirstSubresourceTiling; s < total_subresources && count < *SubresourceTilingCount; s++, count++) {
+        auto &out = SubresourceTilings[count];
+        UINT mip = s % mip_count;
+        UINT slice = s / mip_count;
+        if (mip < num_standard_mips) {
+          out.WidthInTiles = mips[mip].w;
+          out.HeightInTiles = (UINT16)mips[mip].h;
+          out.DepthInTiles = (UINT16)mips[mip].d;
+          out.StartTileIndexInOverallResource = slice * tiles_per_full_slice + mips[mip].start;
+        } else {
+          out.WidthInTiles = 0;
+          out.HeightInTiles = 0;
+          out.DepthInTiles = 0;
+          out.StartTileIndexInOverallResource = D3D12_PACKED_TILE;
+        }
+      }
+      *SubresourceTilingCount = count;
+    }
   };
 
   LUID *STDMETHODCALLTYPE
