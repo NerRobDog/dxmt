@@ -54,9 +54,19 @@ public:
   ) = 0;
 };
 
+class SpatialScaler;
+
 class MTLD3D12CommandQueue : public ID3D12CommandQueue {
 public:
-  virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) = 0;
+  /**
+   * pScaler/pUpscaled are optional: when both are provided, the backbuffer is
+   * upscaled by the MetalFX spatial scaler into pUpscaled, which is presented
+   * instead of the backbuffer.
+   */
+  virtual HRESULT Present(
+      Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
+      SpatialScaler *pScaler = nullptr, ID3D12Resource *pUpscaled = nullptr
+  ) = 0;
 };
 
 class MTLD3D12Resource : public ID3D12Resource {

@@ -21,6 +21,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 #include "dxgi_interfaces.h"
+#include "dxmt_scaler.hpp"
 #include "dxmt_statistics.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
@@ -100,6 +101,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // until the worker has encoded the present.
     Rc<Presenter> presenter;
     Com<ID3D12Resource> backbuffer;
+    // Present with MetalFX spatial upscaling: both stay null on the plain
+    // path. Strong references for the same reason as above - ResizeBuffers
+    // may drop the swapchain's scaler/texture while the worker still has a
+    // pending present that uses them.
+    Rc<SpatialScaler> scaler;
+    Com<ID3D12Resource> upscaled;
     HANDLE semaphore = nullptr;
     double present_after = 0;
   };
@@ -369,10 +376,36 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
       auto g = reinterpret_cast<MTLD3D12Resource *>(sub.backbuffer.ptr());
       auto &view = g->texture->view(g->texture->fullView);
+      WMT::Texture present_texture = view.texture;
+
+      if (sub.scaler && sub.upscaled) {
+        auto u = reinterpret_cast<MTLD3D12Resource *>(sub.upscaled.ptr());
+        auto &upscaled_view = u->texture->view(u->texture->fullView);
+
+        // The MetalFX scaler is not fence-aware beyond its own fence: bridge
+        // the queue fence into the scaler fence and back, so the scale pass
+        // is ordered after the game's rendering to the backbuffer and before
+        // the presenter's blit from the upscaled texture.
+        auto begin_scaler = cmdbuf.blitCommandEncoder();
+        begin_scaler.setLabel(WMT::String::string("BeginScaler", WMTUTF8StringEncoding));
+        begin_scaler.waitForFence(fence_);
+        begin_scaler.updateFence(sub.scaler->fence());
+        begin_scaler.endEncoding();
+
+        cmdbuf.encodeSpatialScale(sub.scaler->scaler(), view.texture, upscaled_view.texture, sub.scaler->fence());
+
+        auto end_scaler = cmdbuf.blitCommandEncoder();
+        end_scaler.setLabel(WMT::String::string("EndScaler", WMTUTF8StringEncoding));
+        end_scaler.waitForFence(sub.scaler->fence());
+        end_scaler.updateFence(fence_);
+        end_scaler.endEncoding();
+
+        present_texture = upscaled_view.texture;
+      }
 
       auto state = sub.presenter->synchronizeLayerProperties();
       auto drawable = sub.presenter->encodeCommands(
-          cmdbuf, view.texture, state.metadata,
+          cmdbuf, present_texture, state.metadata,
           [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
           [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
       );
@@ -563,11 +596,16 @@ public:
   }
 
   HRESULT
-  Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) {
+  Present(
+      Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
+      SpatialScaler *pScaler, ID3D12Resource *pUpscaled
+  ) {
     Submission sub;
     sub.type = Submission::Type::Present;
     sub.presenter = presenter;
     sub.backbuffer = backbuffer;
+    sub.scaler = pScaler;
+    sub.upscaled = pUpscaled;
     sub.semaphore = hLantecyWaitable;
     sub.present_after = after;
     uint64_t qdepth = EnqueueSubmission(std::move(sub));
