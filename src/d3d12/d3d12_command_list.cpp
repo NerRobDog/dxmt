@@ -1227,8 +1227,10 @@ public:
       const D3D12_RECT *Rects
   ) {
     if (Rects || RectCount > 1) {
-      ERR("ClearDepthStencilView: unhandled parameter Rects=", Rects, " RectCount=", RectCount);
-      return;
+      // same approximation as ClearRenderTargetView: full clear instead of drop
+      static bool warned = false;
+      if (!std::exchange(warned, true))
+        WARN("ClearDepthStencilView: ignoring clear rects, performing full clear (RectCount=", RectCount, ")");
     }
     if ((Flags & 3) == 0)
       return;
@@ -1255,8 +1257,11 @@ public:
       D3D12_CPU_DESCRIPTOR_HANDLE RTV, const FLOAT Color[4], UINT RectCount, const D3D12_RECT *Rects
   ) {
     if (Rects || RectCount > 1) {
-      ERR("ClearRenderTargetView: unhandled parameter Rects=", Rects, " RectCount=", RectCount);
-      return;
+      // Rect-bounded clears are approximated by a full-view clear; dropping
+      // them entirely leaves stale garbage in render targets (black UI boxes).
+      static bool warned = false;
+      if (!std::exchange(warned, true))
+        WARN("ClearRenderTargetView: ignoring clear rects, performing full clear (RectCount=", RectCount, ")");
     }
     auto [Heap, Index] = GetRenderTargetHeap(device_, RTV);
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
