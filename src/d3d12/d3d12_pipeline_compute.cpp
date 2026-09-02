@@ -20,8 +20,10 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "dxmt_shader_cache.hpp"
 #include "dxmt_statistics.hpp"
 #include "log/log.hpp"
+#include "sha1/sha1_util.hpp"
 #include "airconv_public.h"
 
 namespace dxmt {
@@ -64,19 +66,33 @@ public:
 
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
 
-    sm50_bitcode_t cs_bitcode;
+    Sha1Digest cs_sha1 = Sha1HashState::compute(pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength);
+    Sha1HashState cs_vh;
+    cs_vh.update((uint32_t)common.metal_version);
+    cs_vh.update(Sha1HashState::compute(rootsig.bytecode, rootsig.bytecode_length));
+    auto cs_key = std::make_pair(cs_sha1, cs_vh.final());
 
-    g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
-    if (SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &cs_bitcode, &sm50_err)) {
-      ERR("Failed to compile cs shader");
-      return E_FAIL;
+    auto &scache = ShaderCache::getInstance(WMTMetal310);
+    WMT::Reference<WMT::DispatchData> cs_data;
+    if (auto reader = scache.getReader())
+      cs_data = reader->get(cs_key);
+    if (!cs_data) {
+      sm50_bitcode_t cs_bitcode;
+
+      g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
+      if (SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &cs_bitcode, &sm50_err)) {
+        ERR("Failed to compile cs shader");
+        return E_FAIL;
+      }
+
+      SM50_COMPILED_BITCODE cs_bitcode_compiled;
+
+      SM50GetCompiledBitcode(cs_bitcode, &cs_bitcode_compiled);
+
+      cs_data = WMT::MakeDispatchData(cs_bitcode_compiled.Data, cs_bitcode_compiled.Size);
+      if (auto writer = scache.getWriter())
+        writer->set(cs_key, cs_data);
     }
-
-    SM50_COMPILED_BITCODE cs_bitcode_compiled;
-
-    SM50GetCompiledBitcode(cs_bitcode, &cs_bitcode_compiled);
-
-    auto cs_data = WMT::MakeDispatchData(cs_bitcode_compiled.Data, cs_bitcode_compiled.Size);
 
     auto metal = device_->GetMTLDevice();
 

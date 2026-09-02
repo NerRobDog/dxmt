@@ -19,6 +19,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_shader_cache.hpp"
 #include "dxmt_statistics.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
@@ -453,19 +454,39 @@ public:
       }
       rootsig.next = &data_ia_layout;
 
-      sm50_bitcode_t vs_bitcode;
+      // disk cache key: (dxbc sha1, variant sha1 over everything SM50Compile sees)
+      Sha1Digest vs_sha1 = Sha1HashState::compute(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
+      Sha1HashState vs_vh;
+      vs_vh.update((uint32_t)common.metal_version);
+      vs_vh.update(data_ia_layout.index_buffer_format);
+      vs_vh.update(data_ia_layout.slot_mask);
+      vs_vh.update(data_ia_layout.num_elements);
+      for (auto &element : elements)
+        vs_vh.update(element);
+      vs_vh.update(Sha1HashState::compute(rootsig.bytecode, rootsig.bytecode_length));
+      auto vs_key = std::make_pair(vs_sha1, vs_vh.final());
 
-      g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
-      if (SM50Compile(
-              shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
-          )) {
-        ERR("Failed to compile vs shader");
-        return E_FAIL;
+      auto &scache = ShaderCache::getInstance(WMTMetal310);
+      WMT::Reference<WMT::DispatchData> vs_data;
+      if (auto reader = scache.getReader())
+        vs_data = reader->get(vs_key);
+      if (!vs_data) {
+        sm50_bitcode_t vs_bitcode;
+
+        g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
+        if (SM50Compile(
+                shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &vs_bitcode, &sm50_err
+            )) {
+          ERR("Failed to compile vs shader");
+          return E_FAIL;
+        }
+
+        SM50_COMPILED_BITCODE vs_bitcode_compiled;
+        SM50GetCompiledBitcode(vs_bitcode, &vs_bitcode_compiled);
+        vs_data = WMT::MakeDispatchData(vs_bitcode_compiled.Data, vs_bitcode_compiled.Size);
+        if (auto writer = scache.getWriter())
+          writer->set(vs_key, vs_data);
       }
-
-      SM50_COMPILED_BITCODE vs_bitcode_compiled;
-      SM50GetCompiledBitcode(vs_bitcode, &vs_bitcode_compiled);
-      auto vs_data = WMT::MakeDispatchData(vs_bitcode_compiled.Data, vs_bitcode_compiled.Size);
       auto vs_lib = metal.newLibrary(vs_data, err);
       vs_func = vs_lib.newFunction("vs_main");
     } else {
@@ -514,17 +535,35 @@ public:
       }
       rootsig.next = &data_ps;
 
-      sm50_bitcode_t ps_bitcode;
-      g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
-      if (SM50Compile(
-              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
-          )) {
-        ERR("Failed to compile ps shader");
-        return E_FAIL;
+      Sha1HashState ps_vh;
+      ps_vh.update((uint32_t)common.metal_version);
+      ps_vh.update(data_ps.dual_source_blending);
+      ps_vh.update(data_ps.disable_depth_output);
+      ps_vh.update(data_ps.unorm_output_reg_mask);
+      ps_vh.update(data_ps.sample_mask);
+      ps_vh.update(data_ps.pixel_formats);
+      ps_vh.update(Sha1HashState::compute(rootsig.bytecode, rootsig.bytecode_length));
+      auto ps_key = std::make_pair(sha1, ps_vh.final());
+
+      auto &scache = ShaderCache::getInstance(WMTMetal310);
+      WMT::Reference<WMT::DispatchData> ps_data;
+      if (auto reader = scache.getReader())
+        ps_data = reader->get(ps_key);
+      if (!ps_data) {
+        sm50_bitcode_t ps_bitcode;
+        g_compiled_shader_variants.fetch_add(1, std::memory_order_relaxed);
+        if (SM50Compile(
+                shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &ps_bitcode, &sm50_err
+            )) {
+          ERR("Failed to compile ps shader");
+          return E_FAIL;
+        }
+        SM50_COMPILED_BITCODE ps_bitcode_compiled;
+        SM50GetCompiledBitcode(ps_bitcode, &ps_bitcode_compiled);
+        ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
+        if (auto writer = scache.getWriter())
+          writer->set(ps_key, ps_data);
       }
-      SM50_COMPILED_BITCODE ps_bitcode_compiled;
-      SM50GetCompiledBitcode(ps_bitcode, &ps_bitcode_compiled);
-      auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
       auto ps_lib = metal.newLibrary(ps_data, err);
       ps_func = ps_lib.newFunction(ps_name.c_str());
     }
