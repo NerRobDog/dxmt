@@ -22,8 +22,10 @@
 #include "dxmt_hud_state.hpp"
 #include "dxmt_presenter.hpp"
 #include "dxmt_info.hpp"
+#include "dxmt_scaler.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "wsi_window.hpp"
 #include "config/config.hpp"
 #include <cfloat>
@@ -150,6 +152,13 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
 
   std::vector<Com<MTLD3D12Resource>> backbuffers_;
 
+  // MetalFX spatial upscaling (env DXMT_METALFX_SPATIAL_SWAPCHAIN=1): the
+  // backbuffers keep the game's render size, one shared intermediate texture
+  // of desc_ * scale_factor receives the upscaled image and is presented.
+  bool metalfx_spatial_ = false;
+  Rc<SpatialScaler> metalfx_scaler_;
+  Com<MTLD3D12Resource> upscaled_backbuffer_;
+
   bool
   LayerSupportEDR() {
     WMTEDRValue edr_value;
@@ -178,6 +187,15 @@ public:
     if (!native_view_) {
       ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
       abort();
+    }
+
+    if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
+      if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
+        metalfx_spatial_ = true;
+        scale_factor = std::max(Config::getInstance().getOption<float>("d3d12.metalSpatialUpscaleFactor", 2), 1.0f);
+      } else {
+        WARN("MetalFX spatial scaler is not supported on this device");
+      }
     }
 
     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count));
@@ -533,6 +551,35 @@ public:
       backbuffers_.push_back(reinterpret_cast<MTLD3D12Resource *>(backbuffer.ptr()));
     }
 
+    if (metalfx_spatial_) {
+      // pending presents keep their own strong references (see Submission)
+      metalfx_scaler_ = nullptr;
+      upscaled_backbuffer_ = nullptr;
+
+      D3D12_RESOURCE_DESC upscaled_desc = backbuffer_desc_;
+      upscaled_desc.Width = (UINT64)(backbuffer_desc_.Width * scale_factor);
+      upscaled_desc.Height = (UINT)(backbuffer_desc_.Height * scale_factor);
+
+      Com<ID3D12Resource> upscaled;
+      if (FAILED(dxmt::CreateCommittedTexture(
+              device_, &heap_props, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, &upscaled_desc,
+              D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&upscaled)
+          ))) {
+        backbuffers_.clear();
+        return E_FAIL;
+      }
+      upscaled_backbuffer_ = reinterpret_cast<MTLD3D12Resource *>(upscaled.ptr());
+
+      WMTFXSpatialScalerInfo info;
+      info.input_width = backbuffer_desc_.Width;
+      info.input_height = backbuffer_desc_.Height;
+      info.output_width = upscaled_desc.Width;
+      info.output_height = upscaled_desc.Height;
+      info.color_format = backbuffers_[0]->texture->pixelFormat();
+      info.output_format = upscaled_backbuffer_->texture->pixelFormat();
+      metalfx_scaler_ = new SpatialScaler(device_->GetMTLDevice(), info);
+    }
+
     return S_OK;
   };
 
@@ -710,7 +757,10 @@ public:
     );
 
     auto &backbuffer = backbuffers_[presentation_count_ % backbuffers_.size()];
-    hr = queue_->Present(this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration);
+    hr = queue_->Present(
+        this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration, metalfx_scaler_.ptr(),
+        upscaled_backbuffer_.ptr()
+    );
 
     presentation_count_ += 1;
 
