@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <span>
 #include <unistd.h>
@@ -293,6 +294,13 @@ public:
         frame_log_ = std::fopen(path, "w");
         if (frame_log_) {
           std::setvbuf(frame_log_, nullptr, _IOFBF, 1 << 20);
+          std::time_t now_wall = std::time(nullptr);
+          char started[64] = "unknown";
+          if (std::tm tm_buf; localtime_s(&tm_buf, &now_wall) == 0)
+            std::strftime(started, sizeof(started), "%Y-%m-%dT%H:%M:%S%z", &tm_buf);
+          // Schema preamble: comment lines before the header identify the format
+          // version and anchor the log to wall clock (frame rows carry no timestamps).
+          std::fprintf(frame_log_, "# schema=dxmt-d3d11 v2\n# started=%s pid=%d\n", started, (int)getpid());
           std::fputs("frame,dt_us,commit_us,prep_us,flush_us,block_us,latwait_us,cmdbufs,compiles\n", frame_log_);
         }
       }
