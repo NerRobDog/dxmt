@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <optional>
 #include <vector>
 #include <unistd.h>
 
@@ -66,6 +67,14 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   uint64_t frame_log_encode_us_ = 0;
   uint64_t frame_log_submits_ = 0;
   uint64_t frame_log_encoders_ = 0;
+  uint64_t frame_log_merged_ = 0;
+  uint64_t frame_log_folded_ = 0;
+  uint64_t frame_log_rebind_ = 0;
+  uint64_t frame_log_cmdbufs_ = 0;
+  uint64_t frame_log_pwait_ = 0;
+  uint64_t frame_log_gbusy_ = 0;
+  uint64_t frame_log_ggap_ = 0;
+  uint64_t frame_log_penc_ = 0;
 
   // cumulative ExecuteCommandLists stats (updated on the encode worker in
   // async mode, on the calling thread in sync mode)
@@ -109,9 +118,24 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     Com<ID3D12Resource> upscaled;
     HANDLE semaphore = nullptr;
     double present_after = 0;
+    // telemetry: when the app thread handed this submission to the worker
+    std::chrono::steady_clock::time_point enqueued_at{};
   };
 
+  // pipeline telemetry (frame log): app thread blocked in Present on the
+  // pending-present backpressure; queue latency of the last Present; GPU busy
+  // time per completed command buffer; idle gaps between consecutive command
+  // buffers on the GPU timeline.
+  std::atomic_uint64_t stat_present_wait_us_{0};
+  std::atomic_uint64_t stat_present_lat_us_{0};
+  std::atomic_uint64_t stat_present_enc_us_{0}; // worker time inside the present encode (drawable wait)
+  std::atomic_uint64_t stat_gpu_busy_ns_{0};
+  std::atomic_uint64_t stat_gpu_gap_ns_{0};
+  uint64_t last_gpu_end_ns_ = 0; // waiting thread only
+
   bool sync_encode_ = false;
+  bool disable_pass_merge_ = false; // DXMT_D3D12_NO_PASS_MERGE=1: A/B switch for the encoder-chain optimizer
+  bool disable_drawable_prefetch_ = false; // DXMT_D3D12_NO_DRAWABLE_PREFETCH=1: nextDrawable() back on the encode thread
   dxmt::mutex mutex_worker_;
   dxmt::condition_variable cv_worker_;
   std::deque<Submission> worker_queue_;
@@ -140,6 +164,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         inflight.cmdbuf.waitUntilCompleted();
       if (inflight.cmdbuf.status() == WMTCommandBufferStatusError)
         ERR("Device error: ", inflight.cmdbuf.error().description().getUTF8String());
+      {
+        uint64_t gs = inflight.cmdbuf.gpuStartTime(), ge = inflight.cmdbuf.gpuEndTime();
+        if (ge > gs) {
+          stat_gpu_busy_ns_.fetch_add(ge - gs, std::memory_order_relaxed);
+          if (last_gpu_end_ns_ && gs > last_gpu_end_ns_)
+            stat_gpu_gap_ns_.fetch_add(gs - last_gpu_end_ns_, std::memory_order_relaxed);
+          if (ge > last_gpu_end_ns_)
+            last_gpu_end_ns_ = ge;
+        }
+      }
 
       if (inflight.semaphore)
         ReleaseSemaphore(inflight.semaphore, 1, nullptr);
@@ -160,6 +194,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
     for (;;) {
       Submission sub;
+      bool queue_drained;
       {
         std::unique_lock<dxmt::mutex> lock(mutex_worker_);
         cv_worker_.wait(lock, [this] { return worker_stop_ || !worker_queue_.empty(); });
@@ -167,9 +202,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           break; // stopped and fully drained
         sub = std::move(worker_queue_.front());
         worker_queue_.pop_front();
+        queue_drained = worker_queue_.empty();
       }
       ProcessSubmission(sub);
+      // nothing else to encode right now: commit what we have so the GPU (and
+      // any app-side fence wait) is never left waiting on an open batch
+      if (queue_drained)
+        FlushBatch();
     }
+    FlushBatch();
   }
 
   struct CommittingScope {
@@ -200,13 +241,202 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     return CommittingScope(this, inflight_cmdbuf_seq_.load(std::memory_order_relaxed));
   }
 
+  /*
+   * Submission batching: one Metal command buffer spans consecutive
+   * submissions instead of one commit per ExecuteCommandLists. The open
+   * batch is committed on Present, when the worker queue runs dry (so a CPU
+   * fence wait on the app side can never wait on an uncommitted signal),
+   * when max_batch_submits_ is reached, or in sync-encode mode after every
+   * submission (the app thread is the worker there).
+   */
+  std::optional<CommittingScope> batch_;
+  unsigned batch_submits_ = 0;
+  unsigned max_batch_submits_ = 32; // DXMT_D3D12_BATCH_SUBMITS=1 restores one commit per submission
+  std::atomic_uint64_t stat_cmdbufs_{0};
+
+  CommittingScope &
+  CurrentBatch() {
+    if (!batch_) {
+      inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
+      batch_.emplace(this, inflight_cmdbuf_seq_.load(std::memory_order_relaxed));
+      batch_submits_ = 0;
+    }
+    return *batch_;
+  }
+
+  void
+  FlushBatch() {
+    if (!batch_)
+      return;
+    batch_.reset(); // ~CommittingScope commits
+    batch_submits_ = 0;
+    stat_cmdbufs_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void
+  EndSubmission() {
+    if (sync_encode_ || ++batch_submits_ >= max_batch_submits_)
+      FlushBatch();
+  }
+
+  /* Retire an encoder node in place: release what it owns (texture views),
+   * keep it in the chain as a Null node so the walk below just skips it. */
+  template <typename T>
+  static void
+  RetireEncoder(T *data) {
+    EncoderData *next = data->next;
+    uint64_t id = data->id;
+    data->~T();
+    data->type = EncoderType::Null;
+    data->next = next;
+    data->id = id;
+  }
+
+  static bool
+  ColorAttachmentMatches(const RenderEncoderColorAttachmentData &a, const RenderEncoderColorAttachmentData &b) {
+    // the view identity already pins mip level / array slice on this path
+    return a.attachment == b.attachment && a.depth_plane == b.depth_plane;
+  }
+
+  /* Clear -> Render on the same attachment: the render pass loads with a
+   * clear instead of running a separate clear-only encoder. Returns true when
+   * the clear was completely absorbed. */
+  static bool
+  FoldClearIntoRender(ClearEncoderData *clear, RenderEncoderData *render) {
+    if (render->render_target_array_length != clear->array_length)
+      return false;
+    if (clear->clear_dsv) {
+      if ((clear->clear_dsv & 1) && (render->dsv_planar_flags & 1) && render->depth.attachment == clear->attachment) {
+        if (render->depth.load_action == WMTLoadActionLoad) {
+          render->depth.load_action = WMTLoadActionClear;
+          render->depth.clear_depth = clear->depth_stencil.first;
+        }
+        clear->clear_dsv &= ~1u;
+      }
+      if ((clear->clear_dsv & 2) && (render->dsv_planar_flags & 2) && render->stencil.attachment == clear->attachment) {
+        if (render->stencil.load_action == WMTLoadActionLoad) {
+          render->stencil.load_action = WMTLoadActionClear;
+          render->stencil.clear_stencil = clear->depth_stencil.second;
+        }
+        clear->clear_dsv &= ~2u;
+      }
+      return clear->clear_dsv == 0;
+    }
+    for (unsigned i = 0; i < render->render_target_count; i++) {
+      auto &a = render->colors[i];
+      if (!a.attachment || a.attachment != clear->attachment || a.depth_plane != clear->depth_plane)
+        continue;
+      if (a.load_action == WMTLoadActionLoad) {
+        a.load_action = WMTLoadActionClear;
+        a.clear_color = clear->color;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /* Render -> Render with identical attachments: append r1's commands to r0's
+   * (r1 keeps the merged result; r0 is retired). r1 re-establishes all pipeline
+   * state at its start, so the encoder state carried over from r0 is harmless. */
+  static bool
+  MergeRenderPasses(RenderEncoderData *r0, RenderEncoderData *r1) {
+    if (r0->barrier_after)
+      return false;
+    if (r0->render_target_count != r1->render_target_count || r0->dsv_planar_flags != r1->dsv_planar_flags ||
+        r0->dsv_readonly_flags != r1->dsv_readonly_flags ||
+        r0->render_target_array_length != r1->render_target_array_length ||
+        r0->render_target_width != r1->render_target_width || r0->render_target_height != r1->render_target_height ||
+        r0->default_raster_sample_count != r1->default_raster_sample_count)
+      return false;
+    for (unsigned i = 0; i < r0->render_target_count; i++) {
+      auto &a0 = r0->colors[i];
+      auto &a1 = r1->colors[i];
+      if (!ColorAttachmentMatches(a0, a1))
+        return false;
+      if (!a0.attachment)
+        continue;
+      if (a0.store_action != WMTStoreActionStore || a1.load_action != WMTLoadActionLoad)
+        return false;
+    }
+    if (r0->dsv_planar_flags & 1) {
+      if (r0->depth.attachment != r1->depth.attachment || r0->depth.store_action != WMTStoreActionStore ||
+          r1->depth.load_action != WMTLoadActionLoad)
+        return false;
+    }
+    if (r0->dsv_planar_flags & 2) {
+      if (r0->stencil.attachment != r1->stencil.attachment || r0->stencil.store_action != WMTStoreActionStore ||
+          r1->stencil.load_action != WMTLoadActionLoad)
+        return false;
+    }
+    // r0's load actions (possibly a folded clear) become the merged pass's
+    for (unsigned i = 0; i < r0->render_target_count; i++) {
+      r1->colors[i].load_action = r0->colors[i].load_action;
+      r1->colors[i].clear_color = r0->colors[i].clear_color;
+    }
+    r1->depth.load_action = r0->depth.load_action;
+    r1->depth.clear_depth = r0->depth.clear_depth;
+    r1->stencil.load_action = r0->stencil.load_action;
+    r1->stencil.clear_stencil = r0->stencil.clear_stencil;
+    if ((void *)r0->cmd_tail != (void *)&r0->cmd_head) {
+      bool r1_empty = (void *)r1->cmd_tail == (void *)&r1->cmd_head;
+      r0->cmd_tail->next.set(r1->cmd_head.next.get());
+      r1->cmd_head.next.set(r0->cmd_head.next.get());
+      if (r1_empty)
+        r1->cmd_tail = r0->cmd_tail;
+      r0->cmd_head.next.set(nullptr);
+      r0->cmd_tail = (wmtcmd_base *)&r0->cmd_head;
+    }
+    r1->use_visibility_result = r0->use_visibility_result || r1->use_visibility_result;
+    r1->use_tessellation = r0->use_tessellation || r1->use_tessellation;
+    r1->use_geometry = r0->use_geometry || r1->use_geometry;
+    return true;
+  }
+
+  /* Encoder-chain optimizer, the d3d12 counterpart of the d3d11 layer's
+   * checkEncoderRelation. The d3d12 layer has no dependency tracking, so only
+   * *adjacent* encoders are considered:
+   *   Clear, Clear  (same attachment)      -> drop the former
+   *   Clear, Render (attachment in pass)   -> load action clear
+   *   Render, Render (same signature, no barrier recorded in the former) -> one encoder
+   * Everything else stays in order. */
+  void
+  OptimizeChain(EncoderData *head) {
+    EncoderData *prev = nullptr;
+    for (EncoderData *cur = head; cur; cur = cur->next) {
+      if (cur->type == EncoderType::Null)
+        continue;
+      if (prev) {
+        if (prev->type == EncoderType::Clear && cur->type == EncoderType::Clear) {
+          auto c0 = static_cast<ClearEncoderData *>(prev), c1 = static_cast<ClearEncoderData *>(cur);
+          if (c0->attachment == c1->attachment && c0->clear_dsv == c1->clear_dsv &&
+              c0->array_length == c1->array_length && c0->depth_plane == c1->depth_plane) {
+            RetireEncoder(c0);
+            g_d3d12_clears_folded.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else if (prev->type == EncoderType::Clear && cur->type == EncoderType::Render) {
+          if (FoldClearIntoRender(static_cast<ClearEncoderData *>(prev), static_cast<RenderEncoderData *>(cur))) {
+            RetireEncoder(static_cast<ClearEncoderData *>(prev));
+            g_d3d12_clears_folded.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else if (prev->type == EncoderType::Render && cur->type == EncoderType::Render) {
+          if (MergeRenderPasses(static_cast<RenderEncoderData *>(prev), static_cast<RenderEncoderData *>(cur))) {
+            RetireEncoder(static_cast<RenderEncoderData *>(prev));
+            g_d3d12_passes_merged.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
+      prev = cur;
+    }
+  }
+
   /* Encode one command list's encoder chain into cmdbuf; returns the number
-   * of encoders processed. Runs on the encode worker in async mode. */
+   * of Metal encoders created. Runs on the encode worker in async mode. */
   uint64_t
   EncodeSubmission(WMT::CommandBuffer cmdbuf, EncoderData *current) {
     uint64_t encoders = 0;
     while (current) {
-      encoders++;
+      if (current->type != EncoderType::Null)
+        encoders++;
       switch (current->type) {
       case EncoderType::Null:
         break;
@@ -352,32 +582,40 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     case Submission::Type::Execute: {
       auto stat_t0 = std::chrono::steady_clock::now();
       uint64_t stat_encoders = 0;
-      auto scope = StartCommitting();
+      auto &scope = CurrentBatch();
       auto &cmdbuf = scope.inflight.cmdbuf;
       for (auto chain : sub.chains) {
-        // +1 accounts for the skipped Null head node, keeping the encoders
-        // stat comparable with the previous synchronous implementation
-        stat_encoders += 1 + EncodeSubmission(cmdbuf, chain);
+        if (!disable_pass_merge_)
+          OptimizeChain(chain);
+        stat_encoders += EncodeSubmission(cmdbuf, chain);
       }
       stat_encoders_.fetch_add(stat_encoders, std::memory_order_relaxed);
       stat_submits_.fetch_add(1, std::memory_order_relaxed);
       stat_encode_us_.fetch_add(
           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - stat_t0).count(),
           std::memory_order_relaxed);
+      EndSubmission();
       break;
     }
     case Submission::Type::Signal: {
-      auto scope = StartCommitting();
+      auto &scope = CurrentBatch();
       sub.fence->signal(scope.inflight.cmdbuf, sub.fence_value);
+      EndSubmission();
       break;
     }
     case Submission::Type::Wait: {
-      auto scope = StartCommitting();
+      auto &scope = CurrentBatch();
       sub.fence->wait(scope.inflight.cmdbuf, sub.fence_value);
+      EndSubmission();
       break;
     }
     case Submission::Type::Present: {
-      auto scope = StartCommitting();
+      if (sub.enqueued_at.time_since_epoch().count())
+        stat_present_lat_us_.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - sub.enqueued_at)
+                .count(),
+            std::memory_order_relaxed);
+      auto &scope = CurrentBatch();
       auto &cmdbuf = scope.inflight.cmdbuf;
 
       auto g = reinterpret_cast<MTLD3D12Resource *>(sub.backbuffer.ptr());
@@ -409,18 +647,28 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         present_texture = upscaled_view.texture;
       }
 
+      if (!disable_drawable_prefetch_)
+        sub.presenter->enableDrawablePrefetch();
       auto state = sub.presenter->synchronizeLayerProperties();
+      auto present_t0 = std::chrono::steady_clock::now();
       auto drawable = sub.presenter->encodeCommands(
           cmdbuf, present_texture, state.metadata,
           [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
           [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
       );
+      // dominated by nextDrawable(): blocks the encode worker while the layer
+      // has no free drawable (paced present / display sync)
+      stat_present_enc_us_.fetch_add(
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - present_t0).count(),
+          std::memory_order_relaxed);
 
       if (sub.present_after > 0)
         cmdbuf.presentDrawableAfterMinimumDuration(drawable, sub.present_after);
       else
         cmdbuf.presentDrawable(drawable);
       scope.inflight.semaphore = sub.semaphore;
+      // a present always closes the batch: the drawable must be committed now
+      FlushBatch();
       pending_presents_.fetch_sub(1, std::memory_order_release);
       pending_presents_.notify_all();
       break;
@@ -436,6 +684,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return 0;
     }
     uint64_t qdepth;
+    sub.enqueued_at = std::chrono::steady_clock::now();
     {
       std::unique_lock<dxmt::mutex> lock(mutex_worker_);
       qdepth = worker_queue_.size();
@@ -450,6 +699,13 @@ public:
       MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice),
       inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }) {
     sync_encode_ = env::getEnvVar("DXMT_D3D12_SYNC_ENCODE") == "1";
+    disable_pass_merge_ = env::getEnvVar("DXMT_D3D12_NO_PASS_MERGE") == "1";
+    disable_drawable_prefetch_ = env::getEnvVar("DXMT_D3D12_NO_DRAWABLE_PREFETCH") == "1";
+    if (auto v = env::getEnvVar("DXMT_D3D12_BATCH_SUBMITS"); !v.empty()) {
+      int parsed = atoi(v.c_str());
+      if (parsed >= 1 && parsed <= 256)
+        max_batch_submits_ = parsed;
+    }
     if (auto v = env::getEnvVar("DXMT_D3D12_MAX_PENDING_PRESENTS"); !v.empty()) {
       int parsed = atoi(v.c_str());
       if (parsed >= 1 && parsed <= 16)
@@ -623,9 +879,15 @@ public:
     sub.present_after = after;
 
     uint32_t pending = pending_presents_.load(std::memory_order_acquire);
-    while (pending >= max_pending_presents_) {
-      pending_presents_.wait(pending, std::memory_order_acquire);
-      pending = pending_presents_.load(std::memory_order_acquire);
+    if (pending >= max_pending_presents_) {
+      auto t0 = std::chrono::steady_clock::now();
+      while (pending >= max_pending_presents_) {
+        pending_presents_.wait(pending, std::memory_order_acquire);
+        pending = pending_presents_.load(std::memory_order_acquire);
+      }
+      stat_present_wait_us_.fetch_add(
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
+          std::memory_order_relaxed);
     }
     pending_presents_.fetch_add(1, std::memory_order_release);
 
@@ -652,7 +914,10 @@ public:
         frame_log_ = std::fopen(path, "w");
         if (frame_log_) {
           std::setvbuf(frame_log_, nullptr, _IOFBF, 1 << 20);
-          std::fputs("frame,dt_us,inflight,compiles,encode_us,submits,encoders,qdepth\n", frame_log_);
+          std::fputs(
+              "frame,dt_us,inflight,compiles,encode_us,submits,encoders,qdepth,merged,folded,rebind,cmdbufs,"
+              "present_wait_us,present_lat_us,gpu_busy_us,gpu_gap_us,present_enc_us\n",
+              frame_log_);
         }
       }
     }
@@ -665,18 +930,41 @@ public:
       uint64_t encode_total = stat_encode_us_.load(std::memory_order_relaxed);
       uint64_t submits_total = stat_submits_.load(std::memory_order_relaxed);
       uint64_t encoders_total = stat_encoders_.load(std::memory_order_relaxed);
+      uint64_t merged_total = g_d3d12_passes_merged.load(std::memory_order_relaxed);
+      uint64_t folded_total = g_d3d12_clears_folded.load(std::memory_order_relaxed);
+      uint64_t rebind_total = g_d3d12_rt_rebind_skipped.load(std::memory_order_relaxed);
+      uint64_t cmdbufs_total = stat_cmdbufs_.load(std::memory_order_relaxed);
+      uint64_t pwait_total = stat_present_wait_us_.load(std::memory_order_relaxed);
+      uint64_t gbusy_total = stat_gpu_busy_ns_.load(std::memory_order_relaxed);
+      uint64_t ggap_total = stat_gpu_gap_ns_.load(std::memory_order_relaxed);
+      uint64_t penc_total = stat_present_enc_us_.load(std::memory_order_relaxed);
       std::fprintf(
-          frame_log_, "%llu,%ld,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)frame_log_frame_, dt_us,
+          frame_log_, "%llu,%ld,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+          (unsigned long long)frame_log_frame_, dt_us,
           (unsigned long long)inflight_cmdbuf_count_.load(std::memory_order_relaxed),
           (unsigned long long)(compiles_total - frame_log_compiles_),
           (unsigned long long)(encode_total - frame_log_encode_us_),
           (unsigned long long)(submits_total - frame_log_submits_),
-          (unsigned long long)(encoders_total - frame_log_encoders_),
-          (unsigned long long)qdepth);
+          (unsigned long long)(encoders_total - frame_log_encoders_), (unsigned long long)qdepth,
+          (unsigned long long)(merged_total - frame_log_merged_), (unsigned long long)(folded_total - frame_log_folded_),
+          (unsigned long long)(rebind_total - frame_log_rebind_), (unsigned long long)(cmdbufs_total - frame_log_cmdbufs_),
+          (unsigned long long)(pwait_total - frame_log_pwait_),
+          (unsigned long long)stat_present_lat_us_.load(std::memory_order_relaxed),
+          (unsigned long long)((gbusy_total - frame_log_gbusy_) / 1000),
+          (unsigned long long)((ggap_total - frame_log_ggap_) / 1000),
+          (unsigned long long)(penc_total - frame_log_penc_));
+      frame_log_penc_ = penc_total;
+      frame_log_pwait_ = pwait_total;
+      frame_log_gbusy_ = gbusy_total;
+      frame_log_ggap_ = ggap_total;
+      frame_log_cmdbufs_ = cmdbufs_total;
       frame_log_compiles_ = compiles_total;
       frame_log_encode_us_ = encode_total;
       frame_log_submits_ = submits_total;
       frame_log_encoders_ = encoders_total;
+      frame_log_merged_ = merged_total;
+      frame_log_folded_ = folded_total;
+      frame_log_rebind_ = rebind_total;
       if ((frame_log_frame_ & 0xff) == 0)
         std::fflush(frame_log_);
     } else {

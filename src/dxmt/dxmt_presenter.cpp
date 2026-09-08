@@ -3,6 +3,7 @@
 #include "Metal.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
+#include "util_env.hpp"
 #include "util_likely.hpp"
 
 
@@ -150,13 +151,78 @@ Presenter::synchronizeLayerProperties() {
   return {metadata, ++frame_requested_, this};
 }
 
-WMT::MetalDrawable
+Presenter::~Presenter() {
+  if (prefetch_thread_.joinable()) {
+    {
+      std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
+      prefetch_stop_ = true;
+    }
+    prefetch_cv_.notify_all();
+    prefetch_thread_.join();
+  }
+}
+
+void
+Presenter::enableDrawablePrefetch() {
+  std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
+  if (prefetch_enabled_)
+    return;
+  prefetch_enabled_ = true;
+  prefetch_wanted_ = true;
+  prefetch_thread_ = dxmt::thread([this]() { this->prefetchLoop(); });
+}
+
+void
+Presenter::prefetchLoop() {
+  env::setThreadName("dxmt-drawable-prefetch");
+  for (;;) {
+    {
+      std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
+      prefetch_cv_.wait(lock, [this] { return prefetch_stop_ || (prefetch_wanted_ && !prefetched_.handle); });
+      if (prefetch_stop_)
+        return;
+      prefetch_wanted_ = false;
+    }
+    WMT::Reference<WMT::MetalDrawable> drawable;
+    {
+      auto pool = WMT::MakeAutoreleasePool();
+      drawable = WMT::Reference<WMT::MetalDrawable>(layer_.nextDrawable()); // retains the autoreleased object
+    }
+    std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
+    if (prefetch_stop_)
+      return; // drawable released here, never presented
+    prefetched_ = std::move(drawable);
+  }
+}
+
+WMT::Reference<WMT::MetalDrawable>
+Presenter::takeDrawable() {
+  if (prefetch_enabled_) {
+    std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
+    WMT::Reference<WMT::MetalDrawable> ready = std::move(prefetched_);
+    prefetched_ = {};
+    prefetch_wanted_ = true; // start fetching the one after this right away
+    lock.unlock();
+    prefetch_cv_.notify_one();
+    if (ready.handle) {
+      // a resize since the fetch makes the drawable stale: fall through to a
+      // synchronous fetch, the reference releases the stale one
+      auto tex = ready.texture();
+      if (tex.width() == (uint64_t)layer_props_.drawable_width && tex.height() == (uint64_t)layer_props_.drawable_height)
+        return ready;
+    }
+    prefetch_misses_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return WMT::Reference<WMT::MetalDrawable>(layer_.nextDrawable());
+}
+
+WMT::Reference<WMT::MetalDrawable>
 Presenter::encodeCommands(
     WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
     std::function<void(WMT::RenderCommandEncoder)> &&update_fences
 ) {
-  auto drawable = layer_.nextDrawable();
+  auto drawable = takeDrawable();
 
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);

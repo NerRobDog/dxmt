@@ -19,9 +19,15 @@
 #pragma once
 
 #include "dxmt_texture.hpp"
+#include <atomic>
 #include <cstdint>
 
 namespace dxmt {
+
+/* d3d12 encoder-chain statistics (process-wide, reported by the frame log) */
+inline std::atomic_uint64_t g_d3d12_rt_rebind_skipped{0}; // OMSetRenderTargets with identical targets kept the pass open
+inline std::atomic_uint64_t g_d3d12_passes_merged{0};     // adjacent render passes with the same signature merged
+inline std::atomic_uint64_t g_d3d12_clears_folded{0};     // Clear encoders folded into the next pass's load action (or dropped as redundant)
 
 enum class EncoderType {
   Null,
@@ -103,6 +109,10 @@ struct RenderEncoderData : EncoderData {
   bool use_visibility_result = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
+  /* A ResourceBarrier was recorded while this pass was current: the app may
+   * read this pass's outputs next, so never merge the following render pass
+   * into it (barriers are otherwise ignored by the d3d12 layer). */
+  bool barrier_after = 0;
 };
 
 struct BlitEncoderData : EncoderData {

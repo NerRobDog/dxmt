@@ -669,6 +669,16 @@ public:
     return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUEndTime);
   }
 
+  uint64_t
+  gpuStartTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUStartTime);
+  }
+
+  uint64_t
+  kernelStartTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyKernelStartTime);
+  }
+
   void
   encodeSignalEvent(Event event, uint64_t value) {
     return MTLCommandBuffer_encodeSignalEvent(handle, event.handle, value);

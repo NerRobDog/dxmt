@@ -1069,8 +1069,11 @@ public:
   };
 
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
-    // TODO: in the initial implementation, we force synchronize everything and ignore barriers (which can be used as
-    // optimization hints later)
+    // Barriers are not translated (every encoder is fully synchronized), but a
+    // barrier inside a render pass is a strong hint that the app is about to
+    // consume what the pass wrote: use it to fence off render pass merging.
+    if (Count && allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render)
+      static_cast<RenderEncoderData *>(allocator_->encoder_current)->barrier_after = true;
   };
 
   void STDMETHODCALLTYPE
@@ -1274,15 +1277,34 @@ public:
       UINT NumRTV, const D3D12_CPU_DESCRIPTOR_HANDLE *RTVs, WINBOOL SingleDescriptor,
       const D3D12_CPU_DESCRIPTOR_HANDLE *DSV
   ) {
+    D3D12_CPU_DESCRIPTOR_HANDLE new_rtvs[8] = {};
+    for (unsigned i = 0; i < NumRTV && i < 8; i++)
+      new_rtvs[i] = SingleDescriptor ? D3D12_CPU_DESCRIPTOR_HANDLE{RTVs[0].ptr + i * 32 /* kRTVDSVHeapIncrementalSize */}
+                                     : RTVs[i];
+    D3D12_CPU_DESCRIPTOR_HANDLE new_dsv = DSV ? *DSV : D3D12_CPU_DESCRIPTOR_HANDLE();
+
+    // Re-binding the exact same targets while a render pass is open (and no
+    // barrier was recorded inside it) does not need a new Metal encoder:
+    // keep the pass open. This is the single biggest source of encoder churn
+    // in engines that call OMSetRenderTargets per draw batch.
+    if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render &&
+        !static_cast<RenderEncoderData *>(allocator_->encoder_current)->barrier_after && NumRTV == num_rtvs &&
+        new_dsv.ptr == dsv.ptr) {
+      bool same = true;
+      for (unsigned i = 0; i < NumRTV && i < 8; i++)
+        same = same && new_rtvs[i].ptr == rtvs[i].ptr;
+      if (same) {
+        g_d3d12_rt_rebind_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+
     allocator_->InvalidateCurrentPass();
 
     num_rtvs = NumRTV;
-    for (unsigned i = 0; i < NumRTV; i++) {
-      auto RTV = SingleDescriptor ? D3D12_CPU_DESCRIPTOR_HANDLE{RTVs[0].ptr + i * 32 /* kRTVDSVHeapIncrementalSize */}
-                                  : RTVs[i];
-      rtvs[i] = RTV;
-    }
-    dsv = DSV ? *DSV : D3D12_CPU_DESCRIPTOR_HANDLE();
+    for (unsigned i = 0; i < NumRTV && i < 8; i++)
+      rtvs[i] = new_rtvs[i];
+    dsv = new_dsv;
   };
 
   void STDMETHODCALLTYPE

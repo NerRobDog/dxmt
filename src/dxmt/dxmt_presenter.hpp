@@ -4,6 +4,7 @@
 #include "rc/util_rc.hpp"
 #include "util_cpu_fence.hpp"
 #include "winemetal.h"
+#include "thread.hpp"
 #include <atomic>
 
 namespace dxmt {
@@ -65,14 +66,40 @@ public:
 
   PresentState synchronizeLayerProperties();
 
-  WMT::MetalDrawable encodeCommands(
+  /* Returns an owning reference: the caller may still present it after the
+   * autorelease pool that (for the synchronous path) holds the drawable is gone. */
+  WMT::Reference<WMT::MetalDrawable> encodeCommands(
       WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
       std::function<void(WMT::RenderCommandEncoder)> &&update_fences
   );
 
+  /*
+   * Drawable prefetch (opt-in). nextDrawable() blocks while the layer holds
+   * every drawable — with display sync or presentDrawableAfterMinimumDuration
+   * pacing that is most of a frame. Calling it on the encode thread stalls
+   * the encoding of the *next* frame and starves the GPU. With prefetch on, a
+   * helper thread fetches the drawable right after the previous present was
+   * encoded, so encodeCommands() normally finds one ready. Idempotent.
+   */
+  void enableDrawablePrefetch();
+  uint64_t drawablePrefetchMisses() const { return prefetch_misses_.load(std::memory_order_relaxed); }
+
+  ~Presenter();
+
 private:
   void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
+  WMT::Reference<WMT::MetalDrawable> takeDrawable();
+  void prefetchLoop();
+
+  dxmt::mutex prefetch_mutex_;
+  dxmt::condition_variable prefetch_cv_;
+  dxmt::thread prefetch_thread_;
+  bool prefetch_enabled_ = false;
+  bool prefetch_stop_ = false;
+  bool prefetch_wanted_ = false;
+  WMT::Reference<WMT::MetalDrawable> prefetched_;
+  std::atomic_uint64_t prefetch_misses_{0};
 
   WMT::Device device_;
   WMT::MetalLayer layer_;
