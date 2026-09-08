@@ -192,26 +192,39 @@ Presenter::prefetchLoop() {
     if (prefetch_stop_)
       return; // drawable released here, never presented
     prefetched_ = std::move(drawable);
+    lock.unlock();
+    prefetch_cv_.notify_all(); // a consumer may be waiting for it
   }
 }
 
 WMT::Reference<WMT::MetalDrawable>
 Presenter::takeDrawable() {
   if (prefetch_enabled_) {
-    std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
-    WMT::Reference<WMT::MetalDrawable> ready = std::move(prefetched_);
-    prefetched_ = {};
-    prefetch_wanted_ = true; // start fetching the one after this right away
-    lock.unlock();
-    prefetch_cv_.notify_one();
-    if (ready.handle) {
-      // a resize since the fetch makes the drawable stale: fall through to a
-      // synchronous fetch, the reference releases the stale one
+    for (;;) {
+      std::unique_lock<dxmt::mutex> lock(prefetch_mutex_);
+      if (!prefetched_.handle) {
+        // Not ready yet: wait for the helper's fetch rather than opening a
+        // second nextDrawable() from this thread. Two outstanding requests hold
+        // two of the layer's three drawables and turn one miss into a long run
+        // of misses (observed: 15-19 frames of ~12 ms stalls at a time).
+        prefetch_misses_.fetch_add(1, std::memory_order_relaxed);
+        prefetch_wanted_ = true;
+        prefetch_cv_.notify_all();
+        prefetch_cv_.wait(lock, [this] { return prefetched_.handle || prefetch_stop_; });
+        if (prefetch_stop_)
+          break;
+      }
+      WMT::Reference<WMT::MetalDrawable> ready = std::move(prefetched_);
+      prefetched_ = {};
+      prefetch_wanted_ = true; // start fetching the one after this right away
+      lock.unlock();
+      prefetch_cv_.notify_all();
+      // a resize since the fetch makes the drawable stale: release it (the
+      // reference does) and wait for the next one
       auto tex = ready.texture();
       if (tex.width() == (uint64_t)layer_props_.drawable_width && tex.height() == (uint64_t)layer_props_.drawable_height)
         return ready;
     }
-    prefetch_misses_.fetch_add(1, std::memory_order_relaxed);
   }
   return WMT::Reference<WMT::MetalDrawable>(layer_.nextDrawable());
 }

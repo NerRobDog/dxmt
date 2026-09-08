@@ -29,6 +29,9 @@
 #include "wsi_window.hpp"
 #include "config/config.hpp"
 #include <cfloat>
+#include <chrono>
+#include <thread>
+#include <immintrin.h>
 
 /**
 Ref: https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency
@@ -147,6 +150,29 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   HUDState hud;
   double init_refresh_rate_ = DBL_MAX;
   int preferred_max_frame_rate = 0;
+  bool cpu_pacing_ = false;
+  std::chrono::steady_clock::time_point pace_next_{};
+
+  /* Sleep on the calling (app) thread until the next pacing deadline. Coarse
+   * sleep first (Wine's Sleep granularity is ~1 ms), then spin the remainder
+   * so the cadence stays tight. Debt is not accumulated: a late frame resets
+   * the deadline to now instead of trying to catch up with back-to-back frames. */
+  void
+  PaceOnCpu() {
+    using namespace std::chrono;
+    auto period = duration_cast<steady_clock::duration>(duration<double>(1.0 / preferred_max_frame_rate));
+    auto now = steady_clock::now();
+    if (pace_next_.time_since_epoch().count() == 0 || now > pace_next_ + period)
+      pace_next_ = now;
+    if (now < pace_next_) {
+      auto coarse = pace_next_ - milliseconds(2);
+      if (now < coarse)
+        std::this_thread::sleep_until(coarse);
+      while (steady_clock::now() < pace_next_)
+        _mm_pause();
+    }
+    pace_next_ += period;
+  }
   ModeSetGuard modeset_guard_;
   dxmt::mutex mutex_;
 
@@ -218,6 +244,12 @@ public:
     }
 
     preferred_max_frame_rate = Config::getInstance().getOption<int>("d3d12.preferredMaxFrameRate", 0);
+    // d3d12.cpuPacing: pace on the app thread (sleep before enqueuing the
+    // present) instead of presentDrawableAfterMinimumDuration. The Metal
+    // minimum-duration path holds a drawable until the slot elapses, so a frame
+    // that overruns the period costs a whole extra slot; sleeping on the app
+    // thread degrades gracefully instead. Also ignores the app's SyncInterval.
+    cpu_pacing_ = Config::getInstance().getOption<bool>("d3d12.cpuPacing", false);
     wsi::WsiMode current_mode;
     if (wsi::getCurrentDisplayMode(monitor_, &current_mode) && current_mode.refreshRate.denominator != 0 &&
         current_mode.refreshRate.numerator != 0) {
@@ -755,6 +787,10 @@ public:
         SyncInterval * 1.0 / (preferred_max_frame_rate ? preferred_max_frame_rate : init_refresh_rate_),
         preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0
     );
+    if (cpu_pacing_ && preferred_max_frame_rate) {
+      PaceOnCpu();
+      vsync_duration = 0; // no minimum-duration hold on the drawable
+    }
 
     auto &backbuffer = backbuffers_[presentation_count_ % backbuffers_.size()];
     hr = queue_->Present(
