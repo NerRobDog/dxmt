@@ -263,8 +263,6 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   bool release_ir_ =
       Config::getInstance().getOption<bool>("d3d11.releaseShaderIR", true);
 
-  task_scheduler<ThreadpoolWork *> scheduler_;
-
   MTLD3D11Device *device;
   StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
 
@@ -289,6 +287,15 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
   dxmt::mutex mutex_cs_;
+
+  /* Keep this the LAST data member. Members are destroyed in reverse order of
+   * declaration, so the scheduler goes first: ~task_scheduler joins its worker
+   * threads while shaders_ and the pipeline maps above are still alive. Declared
+   * before them (as it used to be), the maps were freed first and a worker still
+   * compiling a variant or a PSO could run on a freed CompiledShader /
+   * MTLCompiled*Pipeline, or on the CachedSM50Shader it takes IR from
+   * (ir_ensure/ir_use_end), during device teardown. */
+  task_scheduler<ThreadpoolWork *> scheduler_;
 
   CachedSM50Shader *CreateShader(const void *pBytecode,
                                  uint32_t BytecodeLength) {
