@@ -26,14 +26,28 @@ namespace dxmt::env {
 
 std::string getEnvVar(const char *name) {
 #ifdef _WIN32
+  /* No MAX_PATH ceiling: DXMT_CONFIG_FILE, DXMT_LOG_PATH and
+   * DXMT_SHADER_CACHE_PATH are Unix paths inside a game home, and DXMT_CONFIG
+   * is a list of options; any of them can be longer than 260 characters. With
+   * a fixed MAX_PATH buffer the call fails with the required size and the
+   * variable used to read back as an empty string, i.e. silently unset. Ask
+   * for the size, then read; retry if the value grew in between. A value holds
+   * at most 32767 characters. */
+  const std::wstring key = str::tows(name);
   std::vector<WCHAR> result;
-  result.resize(MAX_PATH + 1);
+  DWORD size = ::GetEnvironmentVariableW(key.c_str(), nullptr, 0);
 
-  DWORD len = ::GetEnvironmentVariableW(str::tows(name).c_str(), result.data(),
-                                        MAX_PATH);
-  result.resize(len);
+  for (int attempt = 0; attempt < 4 && size != 0 && size <= 32768; attempt++) {
+    result.assign(size, 0);
+    DWORD len = ::GetEnvironmentVariableW(key.c_str(), result.data(), size);
+    if (len == 0)
+      return "";
+    if (len < size)
+      return str::fromws(result.data());
+    size = len; /* value grew: len is the new required size */
+  }
 
-  return str::fromws(result.data());
+  return "";
 #else
   const char *result = std::getenv(name);
   return result ? result : "";
