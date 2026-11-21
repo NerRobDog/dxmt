@@ -6,6 +6,7 @@
 #include "dxmt_statistics.hpp"
 #include "sha1/sha1_util.hpp"
 #include <mutex>
+#include <vector>
 
 namespace dxmt {
 

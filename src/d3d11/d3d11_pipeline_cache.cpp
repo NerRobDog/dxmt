@@ -10,6 +10,7 @@
 #include "sha1/sha1_util.hpp"
 #include "../d3d10/d3d10_shader.hpp"
 #include "../d3d10/d3d10_input_layout.hpp"
+#include <atomic>
 #include <cstring>
 #include <shared_mutex>
 
