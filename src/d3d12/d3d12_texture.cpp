@@ -110,8 +110,12 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
     Usage |= WMTTextureUsageRenderTarget;
-  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    if (Format.PixelFormat == WMTPixelFormatR32Uint || Format.PixelFormat == WMTPixelFormatR32Sint ||
+        (Format.PixelFormat == WMTPixelFormatRG32Uint && Device.supportsFamily(WMTGPUFamilyApple8)))
+      Usage |= WMTTextureUsageShaderAtomic;
+  }
   if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
     Usage |= WMTTextureUsageShaderRead;
   InfoOut.usage = Usage;
@@ -215,14 +219,18 @@ public:
 
     texture = new Texture(texture_info, device_->GetMTLDevice());
     Flags<TextureAllocationFlag> flags = {};
-    texture->rename(texture->allocate(flags));
-    device_->RegisterResidency(texture->current()->texture());
+    if (pHeap) {
+      texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
+    } else {
+      texture->rename(texture->allocate(flags));
+      device_->RegisterResidency(texture->current()->texture());
+    }
 
     return S_OK;
   };
 
   ~MTLD3D12Texture() {
-    if (texture)
+    if (texture && texture->current() && !texture->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
       device_->UnregisterResidency(texture->current()->texture());
   }
 

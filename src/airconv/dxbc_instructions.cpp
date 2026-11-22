@@ -38,6 +38,13 @@ auto readOperandRelativeIndex(
     };
   }
 
+  case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID: {
+    // Hull shaders index the input patch with the control point they run for.
+    return IndexByControlPointId{
+      .offset = offset,
+    };
+  }
+
   case D3D10_SB_OPERAND_TYPE_INDEXABLE_TEMP: {
     return IndexByIndexableTempComponent{
       .regfile = OpIndex.m_RelIndex,
@@ -50,6 +57,7 @@ auto readOperandRelativeIndex(
 
   default:
     DXASSERT_DXBC(false);
+    return 0u;
   };
 };
 
@@ -270,14 +278,14 @@ SrcOperand readSrcOperand(
     return SrcOperandInputICP{
       ._ = readSrcOperandCommon(O, read_type),
       .cpid = readOperandIndex(O.m_Index[0], O.m_IndexType[0], phase),
-      .regid = O.m_Index[1].m_RegIndex,
+      .regid = readOperandIndex(O.m_Index[1], O.m_IndexType[1], phase),
     };
   }
   case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT: {
     return SrcOperandInputOCP{
       ._ = readSrcOperandCommon(O, read_type),
       .cpid = readOperandIndex(O.m_Index[0], O.m_IndexType[0], phase),
-      .regid = O.m_Index[1].m_RegIndex,
+      .regid = readOperandIndex(O.m_Index[1], O.m_IndexType[1], phase),
     };
   }
   case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT: {
@@ -1822,7 +1830,6 @@ Instruction readInstruction(
     return inst;
   };
   case microsoft::D3D11_SB_OPCODE_ATOMIC_CMP_STORE: {
-    shader_info.use_cmp_exch = true;
     auto inst = InstAtomicImmCmpExchange{
       .dst = DstOperandSideEffect{._ = {.mask = 0b1111, .write_type = OperandDataType::Integer}},
       .dst_resource = readAtomicDst(Inst.m_Operands[0], phase),
@@ -1880,7 +1887,6 @@ Instruction readInstruction(
   };
 
   case microsoft::D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH: {
-    shader_info.use_cmp_exch = true;
     auto inst = InstAtomicImmCmpExchange{
       .dst = readDstOperand(Inst.m_Operands[0], phase, OperandDataType::Integer),
       .dst_resource = readAtomicDst(Inst.m_Operands[1], phase),
@@ -2098,6 +2104,7 @@ Instruction readInstruction(
   default: {
     llvm::outs() << "unhandled dxbc instruction " << Inst.OpCode() << "\n";
     assert(0 && "unhandled dxbc instruction");
+    return InstNop {};
   }
   }
 };

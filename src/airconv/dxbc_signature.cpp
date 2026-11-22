@@ -90,22 +90,16 @@ void handle_signature_vs(
     switch (sgv) {
     case D3D10_SB_NAME_VERTEX_ID: {
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect_bind([=](struct context ctx) {
-          return store_at_vec4_array_masked(
-            ctx.resource.input.ptr_int4, ctx.builder.getInt32(reg),
-            ctx.resource.vertex_id, mask
-          );
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeVertexIDInput(reg, mask);
         });
       });
       break;
     }
     case D3D10_SB_NAME_INSTANCE_ID: {
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect_bind([=](struct context ctx) {
-          return store_at_vec4_array_masked(
-            ctx.resource.input.ptr_int4, ctx.builder.getInt32(reg),
-            ctx.resource.instance_id, mask
-          );
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInstanceIDInput(reg, mask);
         });
       });
       break;
@@ -132,23 +126,36 @@ void handle_signature_vs(
       max_input_register = std::max(reg + 1, max_input_register);
       if (sig.mask() == 0) break;
       signature_handlers.push_back(
-        [=, type = (InputAttributeComponentType)sig.componentType(),
+        [=, type = sig.componentType(),
          name = sig.consistentAttributeName()](SignatureContext &ctx) {
           if (ctx.ia_layout) {
             for (unsigned i = 0; i < ctx.ia_layout->num_elements; i++) {
               if (ctx.ia_layout->elements[i].reg == reg) {
-                ctx.prologue << pull_vertex_input(
-                  ctx.func_signature, reg, mask, ctx.ia_layout->elements[i],
-                  ctx.ia_layout->slot_mask
-                );
+                auto element_info = ctx.ia_layout->elements[i];
+                auto slot_mask = ctx.ia_layout->slot_mask;
+                auto vbuf_table = ctx.func_signature.DefineInput(air::ArgumentBindingBuffer{
+                  .buffer_size = {},
+                  .location_index = SM50_BINDING_INDEX_VERTEX_BUFFER,
+                  .array_size = 0,
+                  .memory_access = air::MemoryAccess::read,
+                  .address_space = air::AddressSpace::constant,
+                  .type = air::msl_uint,
+                  .arg_name = "vertex_buffers",
+                  .raster_order_group = {},
+                });
+                ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+                  return io.PullVertexInput(vbuf_table, reg, mask, element_info, slot_mask);
+                });
                 break;
               }
             }
           } else {
             auto assigned_index = ctx.func_signature.DefineInput(
-              InputVertexStageIn{.attribute = reg, .type = type, .name = name}
+              InputVertexStageIn{.attribute = reg, .type = to_msl_type(type), .name = name}
             );
-            ctx.prologue << init_input_reg(assigned_index, reg, mask);
+            ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+              return io.InitializeInput(assigned_index, reg, mask);
+            });
           }
         }
       );
@@ -180,7 +187,9 @@ void handle_signature_vs(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutput(reg, mask, ret, assigned_index);
+        });
       });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
@@ -200,7 +209,9 @@ void handle_signature_vs(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutput(reg, mask, ret, assigned_index);
+        });
       });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
@@ -211,7 +222,9 @@ void handle_signature_vs(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg_sanitize_pos(reg, mask, assigned_index);
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutputSanitizePosition(reg, mask, ret, assigned_index);
+        });
       });
       break;
     }
@@ -221,7 +234,9 @@ void handle_signature_vs(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutput(reg, mask, ret, assigned_index);
+        });
       });
       break;
     }
@@ -231,7 +246,9 @@ void handle_signature_vs(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutput(reg, mask, ret, assigned_index);
+        });
       });
       break;
     }
@@ -261,7 +278,9 @@ void handle_signature_vs(
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutput(reg, mask, ret, assigned_index);
+        });
       });
       break;
     }
@@ -269,6 +288,10 @@ void handle_signature_vs(
       assert(0 && "unhandled vertex shader output");
       break;
     }
+    break;
+  }
+  case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
+    assert(0 && "dcl_output_sgv should not happen in vs");
     break;
   }
   default:
@@ -326,10 +349,8 @@ void handle_signature_ps(
     case D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK: {
       auto assigned_index = func_signature.DefineInput(InputInputCoverage{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([=](struct context ctx) {
-          auto attr = ctx.function->getArg(assigned_index);
-          ctx.resource.coverage_mask_arg = attr;
-          return std::monostate{};
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInputAttribute(InputAttribute::CoverageMask, assigned_index);
         });
       });
       break;
@@ -392,9 +413,9 @@ void handle_signature_ps(
       break;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
-      ctx.prologue << init_input_reg(
-        assigned_index, reg, mask, siv == D3D10_SB_NAME_POSITION
-      );
+      ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+        return io.InitializeInput(assigned_index, reg, mask, siv == D3D10_SB_NAME_POSITION);
+      });
     });
     max_input_register = std::max(reg + 1, max_input_register);
     break;
@@ -423,7 +444,9 @@ void handle_signature_ps(
       break;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
-      ctx.prologue << init_input_reg(assigned_index, reg, mask);
+      ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+        return io.InitializeInput(assigned_index, reg, mask);
+      });
     });
     max_input_register = std::max(reg + 1, max_input_register);
     break;
@@ -447,11 +470,7 @@ void handle_signature_ps(
       if (pull_mode) {
         assert(type == RegisterComponentType::Float && "otherwise the input register contains mixed data type");
         ctx.resource.interpolant_map[reg] = interpolant_descriptor{
-          [=](auto) {
-            return make_irvalue([=](struct context ctx) {
-              return ctx.function->getArg(assigned_index);
-            });
-          },
+          assigned_index,
           (interpolation == air::Interpolation::sample_perspective ||
            interpolation == air::Interpolation::center_perspective ||
            interpolation == air::Interpolation::centroid_perspective)
@@ -465,16 +484,19 @@ void handle_signature_ps(
         default:
           break;
         }
-        ctx.prologue << init_input_reg_with_interpolation(assigned_index, reg, mask, interpolation, sampleidx_at);
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInterpolatedInput(assigned_index, reg, mask, interpolation, sampleidx_at);
+        });
       } else {
-        ctx.prologue << init_input_reg(assigned_index, reg, mask);
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInput(assigned_index, reg, mask);
+        });
       }
     });
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
-    // only GS PrimitiveID uses this, but we don't support GS for now
+    assert(0 && "dcl_output_sgv should not happen in ps");
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
@@ -496,14 +518,8 @@ void handle_signature_ps(
     case D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL:
     case D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL: {
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([](struct context ctx) -> std::monostate {
-          assert(
-            ctx.resource.depth_output_reg == nullptr &&
-            "otherwise oDepth is defined twice"
-          );
-          ctx.resource.depth_output_reg =
-            ctx.builder.CreateAlloca(ctx.types._float);
-          return {};
+        ctx.prologue.Add([](IOHelper &io) -> llvm::Error {
+          return io.CreateDepthOutputRegister();
         });
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
@@ -517,76 +533,39 @@ void handle_signature_ps(
               ? DepthArgument::less
               : DepthArgument::any
         });
-        ctx.epilogue >> [=](pvalue v) {
-          return make_irvalue([=](struct context ctx) {
-            return ctx.builder.CreateInsertValue(
-              v,
-              ctx.builder.CreateLoad(
-                ctx.types._float,
-                ctx.builder.CreateConstInBoundsGEP1_32(
-                  ctx.types._float, ctx.resource.depth_output_reg, 0
-                )
-              ),
-              {assigned_index}
-            );
-          });
-        };
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutputDepth(ret, assigned_index);
+        });
       });
       break;
     }
     case D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF: {
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([](struct context ctx) -> std::monostate {
-          assert(ctx.resource.stencil_ref_reg == nullptr && "otherwise oStencil is defined twice");
-          ctx.resource.stencil_ref_reg = ctx.builder.CreateAlloca(ctx.types._int);
-          return {};
+        ctx.prologue.Add([](IOHelper &io) -> llvm::Error {
+          return io.CreateStencilRefOutputRegister();
         });
       });
       auto assigned_index = func_signature.DefineOutput(OutputStencilRef{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.epilogue >> [=](pvalue v) {
-          return make_irvalue([=](struct context ctx) {
-            auto ostencil = ctx.builder.CreateLoad(
-                ctx.types._int, ctx.builder.CreateConstInBoundsGEP1_32(ctx.types._int, ctx.resource.stencil_ref_reg, 0)
-            );
-            return ctx.builder.CreateInsertValue(v, ostencil, {assigned_index});
-          });
-        };
+        ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutputStencilRef(ret, assigned_index);
+        });
       });
       break;
     }
     case D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK: {
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([](struct context ctx) -> std::monostate {
-          assert(
-            ctx.resource.coverage_mask_reg == nullptr &&
-            "otherwise oMask is defined twice"
-          );
-          ctx.resource.coverage_mask_reg =
-            ctx.builder.CreateAlloca(ctx.types._int);
-          return {};
+        ctx.prologue.Add([](IOHelper &io) -> llvm::Error {
+          return io.CreateCoverageMaskOutputRegister();
         });
       });
       auto assigned_index = func_signature.DefineOutput(OutputCoverageMask{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.epilogue >> [=](pvalue v) {
-          return make_irvalue([=](struct context ctx) {
-            auto odepth = ctx.builder.CreateLoad(
-              ctx.types._int,
-              ctx.builder.CreateConstInBoundsGEP1_32(
-                ctx.types._int, ctx.resource.coverage_mask_reg, 0
-              )
-            );
-            return ctx.builder.CreateInsertValue(
-              v,
-              ctx.pso_sample_mask != 0xffffffff
-                ? ctx.builder.CreateAnd(odepth, ctx.pso_sample_mask)
-                : odepth,
-              {assigned_index}
-            );
-          });
-        };
+        ctx.epilogue.Add([=, sample_mask = ctx.pso_sample_mask](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+          return io.PopulateOutputCoverageMask(ret, assigned_index, sample_mask);
+        });
       });
+      sm50_shader->ps_has_coverage_output = 1;
       break;
     }
 
@@ -622,9 +601,13 @@ void handle_signature_ps(
           });
         }
         if (type == RegisterComponentType::Float && ctx.unorm_output_reg_mask & (1 << reg))
-          ctx.epilogue >> pop_output_reg_fix_unorm(reg, mask, assigned_index);
+          ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+            return io.PopulateOutputFixUnorm(reg, mask, ret, assigned_index);
+          });
         else
-          ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+          ctx.epilogue.Add([=](llvm::Value *ret, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+            return io.PopulateOutput(reg, mask, ret, assigned_index);
+          });
       });
       break;
     }
@@ -695,8 +678,7 @@ void handle_signature_hs(
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
-    // only GS PrimitiveID uses this, but we don't support GS for now
+    assert(0 && "dcl_output_sgv should not happen in hs");
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
@@ -881,8 +863,7 @@ void handle_signature_ds(
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
-    // only GS PrimitiveID uses this, but we don't support GS for now
+    assert(0 && "dcl_output_sgv should not happen in ds");
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
@@ -898,6 +879,15 @@ void handle_signature_ds(
           );
         }
       }
+      auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+      func_signature.DefineMeshVertexOutput(OutputMeshData{
+        .user = std::format("SV_ClipDistance{}", reg),
+        .type = msl_float4,
+        .index = mesh_vertex_data_index
+      });
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputVertexData(reg, mask, mesh_vertex_data_index, output.vertex_id, msl_float4);
+      });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
@@ -909,27 +899,36 @@ void handle_signature_ds(
           );
         }
       }
+      auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+      func_signature.DefineMeshVertexOutput(OutputMeshData{
+        .user = std::format("SV_CullDistance{}", reg),
+        .type = msl_float4,
+        .index = mesh_vertex_data_index
+      });
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputVertexData(reg, mask, mesh_vertex_data_index, output.vertex_id, msl_float4);
+      });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
     case D3D10_SB_NAME_POSITION: {
       func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_position(reg, mask, output.vertex_id);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputPosition(reg, mask, output.vertex_id);
       });
       break;
     }
     case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX: {
       func_signature.DefineMeshPrimitiveOutput(OutputRenderTargetArrayIndex{});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_render_target_array_index(reg, mask, output.primitive_id);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputRenderTargetArrayIndex(reg, mask, output.primitive_id);
       });
       break;
     }
     case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX: {
       func_signature.DefineMeshPrimitiveOutput(OutputViewportArrayIndex{});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_viewport_array_index(reg, mask, output.primitive_id);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputViewportArrayIndex(reg, mask, output.primitive_id);
       });
       break;
     }
@@ -959,8 +958,8 @@ void handle_signature_ds(
         .type = type,
         .index = mesh_vertex_data_index
       });
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_vertex_data(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputVertexData(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
       });
       break;
     }
@@ -997,10 +996,8 @@ void handle_signature_cs(
       auto assigned_index =
         func_signature.DefineInput(InputThreadPositionInGrid{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([=](struct context ctx) {
-          auto attr = ctx.function->getArg(assigned_index);
-          ctx.resource.thread_id_arg = attr;
-          return std::monostate{};
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInputAttribute(InputAttribute::ThreadId, assigned_index);
         });
       });
       break;
@@ -1009,10 +1006,8 @@ void handle_signature_cs(
       auto assigned_index =
         func_signature.DefineInput(InputThreadgroupPositionInGrid{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([=](struct context ctx) {
-          auto attr = ctx.function->getArg(assigned_index);
-          ctx.resource.thread_group_id_arg = attr;
-          return std::monostate{};
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInputAttribute(InputAttribute::ThreadGroupId, assigned_index);
         });
       });
       break;
@@ -1021,10 +1016,8 @@ void handle_signature_cs(
       auto assigned_index =
         func_signature.DefineInput(InputThreadPositionInThreadgroup{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([=](struct context ctx) {
-          auto attr = ctx.function->getArg(assigned_index);
-          ctx.resource.thread_id_in_group_arg = attr;
-          return std::monostate{};
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInputAttribute(InputAttribute::ThreadIdInGroup, assigned_index);
         });
       });
       break;
@@ -1033,10 +1026,8 @@ void handle_signature_cs(
       auto assigned_index =
         func_signature.DefineInput(InputThreadIndexInThreadgroup{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
-        ctx.prologue << make_effect([=](struct context ctx) {
-          auto attr = ctx.function->getArg(assigned_index);
-          ctx.resource.thread_id_in_group_flat_arg = attr;
-          return std::monostate{};
+        ctx.prologue.Add([=](IOHelper &io) -> llvm::Error {
+          return io.InitializeInputAttribute(InputAttribute::ThreadIdInGroupFlatten, assigned_index);
         });
       });
       break;
@@ -1110,6 +1101,7 @@ handle_signature_gs(
       break;
     }
     case microsoft::D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
+    case microsoft::D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
       break;
     default:
       assert(0 && "unhandled geometry shader input");
@@ -1118,7 +1110,22 @@ handle_signature_gs(
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "unhandled geometry shader output sgv");
+    unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
+    auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
+    auto sgv = Inst.m_OutputDeclSGV.Name;
+    switch (sgv) {
+     case D3D10_SB_NAME_PRIMITIVE_ID: {
+      func_signature.DefineMeshPrimitiveOutput(OutputPrimitiveID{});
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputPrimitiveID(reg, mask, output.primitive_id);
+      });
+      break;
+     }
+     default:
+      assert(0 && "unhandled geometry shader output sgv");
+      break;
+    }
+    max_output_register = std::max(reg + 1, max_output_register);
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
@@ -1132,6 +1139,15 @@ handle_signature_gs(
           sm50_shader->clip_distance_scalars.push_back({.component = (uint8_t)(i), .reg = (uint8_t)reg});
         }
       }
+      auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+      func_signature.DefineMeshVertexOutput(OutputMeshData{
+        .user = std::format("SV_ClipDistance{}", reg),
+        .type = msl_float4,
+        .index = mesh_vertex_data_index
+      });
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputVertexData(reg, mask, mesh_vertex_data_index, output.vertex_id, msl_float4);
+      });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
@@ -1141,27 +1157,36 @@ handle_signature_gs(
           sm50_shader->cull_distance_scalars.push_back({.component = (uint8_t)(i), .reg = (uint8_t)reg});
         }
       }
+      auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+      func_signature.DefineMeshVertexOutput(OutputMeshData{
+        .user = std::format("SV_CullDistance{}", reg),
+        .type = msl_float4,
+        .index = mesh_vertex_data_index
+      });
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputVertexData(reg, mask, mesh_vertex_data_index, output.vertex_id, msl_float4);
+      });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
     case D3D10_SB_NAME_POSITION: {
       func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_position(reg, mask, output.vertex_id);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputPosition(reg, mask, output.vertex_id);
       });
       break;
     }
     case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX: {
       func_signature.DefineMeshPrimitiveOutput(OutputRenderTargetArrayIndex{});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_render_target_array_index(reg, mask, output.primitive_id);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputRenderTargetArrayIndex(reg, mask, output.primitive_id);
       });
       break;
     }
     case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX: {
       func_signature.DefineMeshPrimitiveOutput(OutputViewportArrayIndex{});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_viewport_array_index(reg, mask, output.primitive_id);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputViewportArrayIndex(reg, mask, output.primitive_id);
       });
       break;
     }
@@ -1191,8 +1216,8 @@ handle_signature_gs(
         .type = type,
         .index = mesh_vertex_data_index
       });
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_vertex_data(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
+      mesh_output_handlers.push_back([=](MeshOutputContext &output, IOHelper &io) {
+        io.PopulateMeshOutputVertexData(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
       });
       break;
     }

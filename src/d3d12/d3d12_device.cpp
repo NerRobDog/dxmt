@@ -25,8 +25,12 @@
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include <map>
+#include "d3d10_1.h"
+#include "d3d11_4.h"
 
 namespace dxmt {
+
+const GUID kD3D12DeviceDownlevelUUID = {0x74eaee3f, 0x2f4b, 0x476d, {0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10}};
 
 HRESULT PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
 
@@ -43,8 +47,13 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
   InternalCommandLibrary command_library;
   FormatCapabilityInspector format_inspector_;
 
+  D3D_FEATURE_LEVEL min_feature_level_;
+
 public:
-  MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter) : adapter_(adapter), command_library(adapter_->GetMTLDevice()) {}
+  MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter, D3D_FEATURE_LEVEL min_feature_level) :
+      adapter_(adapter),
+      command_library(adapter_->GetMTLDevice()),
+      min_feature_level_(min_feature_level) {}
 
   ~MTLD3D12DeviceImpl() {}
 
@@ -57,6 +66,11 @@ public:
       return E_FAIL;
     }
     format_inspector_.Inspect(GetMTLDevice());
+    
+    WMTDepthStencilInfo info{};
+    info.depth_compare_function = WMTCompareFunctionAlways;
+    default_depth_stencil_state = GetMTLDevice().newDepthStencilState(info);
+
     return S_OK;
   };
 
@@ -67,7 +81,7 @@ public:
 
   D3D_FEATURE_LEVEL
   GetFeatureLevel() {
-    return D3D_FEATURE_LEVEL_11_0; // FIXME
+    return min_feature_level_;
   };
 
   HRESULT
@@ -94,6 +108,20 @@ public:
       *ppvObject = ref(this);
       return S_OK;
     }
+
+    if (riid == __uuidof(IDXGIDevice) || riid == __uuidof(IDXGIDevice1) || riid == __uuidof(IDXGIDevice2) ||
+        riid == __uuidof(IDXGIDevice3) || riid == __uuidof(IDXGIDevice4))
+      return E_NOINTERFACE;
+
+    if (riid == __uuidof(ID3D10Device) || riid == __uuidof(ID3D10Device1))
+      return E_NOINTERFACE;
+
+    if (riid == __uuidof(ID3D11Device) || riid == __uuidof(ID3D11Device1) || riid == __uuidof(ID3D11Device2) ||
+        riid == __uuidof(ID3D11Device3) || riid == __uuidof(ID3D11Device4) || riid == __uuidof(ID3D11Device5))
+      return E_NOINTERFACE;
+
+    if (riid == kD3D12DeviceDownlevelUUID)
+      return E_NOINTERFACE;
 
     if (logQueryInterfaceError(__uuidof(ID3D12Device1), riid)) {
       WARN("D3D12Device: Unknown interface query ", str::format(riid));
@@ -174,7 +202,7 @@ public:
       }
 
       if (out->Format == DXGI_FORMAT_UNKNOWN) {
-        out->NumQualityLevels = out->SampleCount == 0 ? 1 : 0;
+        out->NumQualityLevels = out->SampleCount == 1 ? 1 : 0;
         return S_OK;
       }
 
@@ -245,7 +273,10 @@ public:
     case D3D12_FEATURE_SHADER_MODEL: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         return E_INVALIDARG;
-      reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData)->HighestShaderModel = D3D_SHADER_MODEL_5_1;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
+      if (out->HighestShaderModel > D3D_SHADER_MODEL_6_0)
+        return E_INVALIDARG;
+      out->HighestShaderModel = std::min(D3D_SHADER_MODEL_6_0, out->HighestShaderModel);
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
@@ -293,7 +324,8 @@ public:
       out->BarycentricsSupported = FALSE;
       out->CopyQueueTimestampQueriesSupported = FALSE;
       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
-      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+      // DIRECT + BUNDLE + COPY + COMPUTE
+      out->WriteBufferImmediateSupportFlags = (D3D12_COMMAND_LIST_SUPPORT_FLAGS)0xF;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -306,7 +338,42 @@ public:
       out->TotalLaneCount = 0;
       // If CheckFeatureSupport succeeds this value will always be true.
       out->ExpandedComputeResourceStates = TRUE;
-      out->Int64ShaderOps = FALSE;
+      out->Int64ShaderOps = TRUE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS12: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(pFeatureData);
+      out->RelaxedFormatCastingSupported = FALSE;
+      out->EnhancedBarriersSupported = FALSE;
+      out->MSPrimitivesPipelineStatisticIncludesCulledPrimitives = D3D12_TRI_STATE_FALSE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS4: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4 *>(pFeatureData);
+      out->MSAA64KBAlignedTextureSupported = TRUE;
+      out->Native16BitShaderOpsSupported = TRUE;
+      // TODO(d3d12): revise when d3d12 shared resource is implemented
+      out->SharedResourceCompatibilityTier = D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS7: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
+      out->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+      out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_SHADER_CACHE: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_CACHE *>(pFeatureData);
+      out->SupportFlags =
+          D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE | D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE;
       return S_OK;
     }
     case D3D12_FEATURE_FORMAT_SUPPORT: {
@@ -979,6 +1046,7 @@ public:
         desc_graphics.DepthStencilState.DepthFunc = subobject->data.DepthFunc;
         desc_graphics.DepthStencilState.DepthWriteMask = subobject->data.DepthWriteMask;
         desc_graphics.DepthStencilState.StencilWriteMask = subobject->data.StencilWriteMask;
+        desc_graphics.DepthStencilState.StencilReadMask = subobject->data.StencilReadMask;
         desc_graphics.DepthStencilState.BackFace = subobject->data.BackFace;
         desc_graphics.DepthStencilState.FrontFace = subobject->data.FrontFace;
         if (subobject->data.DepthBoundsTestEnable) {
@@ -1166,6 +1234,8 @@ public:
   RegisterResidencyAndVA(BufferAllocation *allocation) {
     std::unique_lock<dxmt::mutex> lock(residency_lock_);
     interval_map_.emplace(allocation->gpuAddress(), allocation);
+    if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
+      return S_OK;
     auto buffer = allocation->buffer();
     residency_set_.addAllocations(&buffer, 1);
     residency_set_.commit();
@@ -1176,6 +1246,8 @@ public:
   UnregisterResidencyAndVA(BufferAllocation *allocation) {
     std::unique_lock<dxmt::mutex> lock(residency_lock_);
     interval_map_.erase(allocation->gpuAddress());
+    if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
+      return S_OK;
     auto buffer = allocation->buffer();
     residency_set_.removeAllocations(&buffer, 1);
     residency_set_.commit();
@@ -1210,8 +1282,8 @@ public:
 };
 
 HRESULT
-CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice) {
-  auto device = Com(new MTLD3D12DeviceImpl(adapter));
+CreateD3D12Device(IMTLDXGIAdapter *pAdapter, D3D_FEATURE_LEVEL MinimumFeatueLevel, const IID &riid, void **ppDevice) {
+  auto device = Com(new MTLD3D12DeviceImpl(pAdapter, MinimumFeatueLevel));
   HRESULT hr = device->Initialize();
   if (FAILED(hr))
     return hr;

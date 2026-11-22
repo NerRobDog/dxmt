@@ -13,6 +13,9 @@ enum class ScalerDataType {
   Int,
   /* Unsupported in Metal */
   Double,
+  Half,
+  Short,
+  UShort,
 };
 
 enum class ResourceType {
@@ -48,6 +51,7 @@ enum class InputAttribute {
   /* Fragment */
   PrimitiveId,
   CoverageMask,
+  SampleIndex,
 
   /* Hull */
   OutputControlPointId,

@@ -1,6 +1,7 @@
 #include "air_signature.hpp"
 #include "airconv_error.hpp"
 #include "dxbc_converter.hpp"
+#include "dxil_converter.hpp"
 #include "nt/air_builder.hpp"
 #include "nt/dxbc_converter_base.hpp"
 #include "llvm/IR/Constants.h"
@@ -191,7 +192,8 @@ convert_dxbc_vertex_hull_shader(
   auto &hull_shader_info = pHullStage->shader_info;
 
   uint32_t max_vs_input_register = pVertexStage->max_input_register;
-  uint32_t max_vs_output_register = 0;
+  uint32_t max_vs_output_register = pVertexStage->max_output_register;
+  // TODO: below is for DXBC D3D11 quirks, should get rid of it
   for (auto &out : pVertexStage->output_signature) {
     max_vs_output_register = std::max(max_vs_output_register, out.reg() + 1);
   }
@@ -211,21 +213,16 @@ convert_dxbc_vertex_hull_shader(
   args_get_data<SM50_SHADER_IA_INPUT_LAYOUT, SM50_SHADER_IA_INPUT_LAYOUT_DATA>(pArgs, &ia_layout);
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig_vs = nullptr;
+  args_get_data<SM50_SHADER_ROOT_SIGNATURE2, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig_vs);
 
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
+  bool is_dynamic_ib = is_indexed_draw && ia_layout->index_buffer_format == SM50_INDEX_BUFFER_FORMAT_DYNAMIC;
 
-  IREffect prologue_vs([](auto) { return std::monostate(); });
-  IREffect prologue_hs([](auto) { return std::monostate(); });
-  IRValue epilogue_vs([](struct context ctx) -> pvalue {
-    // just return null since the function returns void
-    // and we handle output registers directly
-    return nullptr;
-  });
-  IRValue epilogue_hs([](struct context ctx) -> pvalue {
-    // just return null since the function returns void
-    // and we handle output registers directly
-    return nullptr;
-  });
+  Prologues prologue_vs;
+  Prologues prologue_hs;
+  Epilogues epilogue_vs;
+  Epilogues epilogue_hs;
 
   io_binding_map resource_map_vs;
   io_binding_map resource_map_hs;
@@ -244,15 +241,14 @@ convert_dxbc_vertex_hull_shader(
     }
   }
 
-  auto binding_map = rootsig
-                         ? setup_binding_rootsig(
-                               &vertex_shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
-                               rootsig->bytecode_length, SM50_BINDING_INDEX_ROOT_ARGUMENTS + 2, SM50_BINDING_INDEX_STATIC_SAMPLERS + 2
-                           )
-                         : setup_binding_table2(
-                               &vertex_shader_info, func_signature, module, SM50_BINDING_INDEX_CONSTANT_BUFFER2,
-                               SM50_BINDING_INDEX_ARGUMENT_TABLE2
-                           );
+  auto binding_map = rootsig_vs ? setup_binding_rootsig(
+                                   &vertex_shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER,
+                                   rootsig_vs->bytecode, rootsig_vs->bytecode_length
+                               )
+                             : setup_binding_table2(
+                                   &vertex_shader_info, func_signature, module, SM50_BINDING_INDEX_CONSTANT_BUFFER2,
+                                   SM50_BINDING_INDEX_ARGUMENT_TABLE2
+                               );
   auto binding_map_hs = rootsig ? setup_binding_rootsig(
                                       &hull_shader_info, func_signature, module, D3D11_SB_HULL_SHADER,
                                       rootsig->bytecode, rootsig->bytecode_length
@@ -303,14 +299,16 @@ convert_dxbc_vertex_hull_shader(
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = is_indexed_draw //
-                  ? air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
-                  : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
+          ? is_dynamic_ib
+              ? air::MSLWhateverStruct{"draw_indexed_dynamic_arguments", types._dxmt_draw_dyn_ib_arguments}
+              : air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
+          : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
       .arg_name = "draw_arguments",
       .raster_order_group = {}
   });
 
   uint32_t index_buffer_idx = ~0u;
-  if (is_indexed_draw) {
+  if (is_indexed_draw && !is_dynamic_ib) {
     index_buffer_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
         .buffer_size = {},
         .location_index = SM50_BINDING_INDEX_INDEX_BUFFER,
@@ -369,16 +367,14 @@ convert_dxbc_vertex_hull_shader(
 
   {
     /* Vertex Shader Zone */
-    auto shader_info = vertex_shader_info;
     auto &resource_map = resource_map_vs;
     auto &prologue = prologue_vs;
     auto &epilogue = epilogue_vs;
-    auto max_input_register = max_vs_input_register;
-    auto max_output_register = max_vs_output_register;
 
     auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue_vertex", function);
     setup_metal_version(module, metal_version);
 
+    auto index_check = llvm::BasicBlock::Create(context, "index_check", function);
     auto active = llvm::BasicBlock::Create(context, "active_vertex", function);
 
     auto threadgroup_position_in_grid = function->getArg(tg_id_idx);
@@ -393,7 +389,8 @@ convert_dxbc_vertex_hull_shader(
     );
 
     auto draw_arguments = builder.CreateLoad(
-        is_indexed_draw ? types._dxmt_draw_indexed_arguments : types._dxmt_draw_arguments,
+        is_indexed_draw ? is_dynamic_ib ? types._dxmt_draw_dyn_ib_arguments : types._dxmt_draw_indexed_arguments
+                        : types._dxmt_draw_arguments,
         function->getArg(draw_argument_idx)
     );
 
@@ -401,11 +398,11 @@ convert_dxbc_vertex_hull_shader(
         builder.CreateExtractValue(draw_arguments, 0), builder.getInt32(pHullStage->input_control_point_count)
     );
 
-    resource_map.input.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
+    resource_map.input.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_vs_input_register));
     resource_map.input.ptr_float4 = builder.CreateBitCast(
-        resource_map.input.ptr_int4, llvm::ArrayType::get(types._float4, max_input_register)->getPointerTo()
+        resource_map.input.ptr_int4, llvm::ArrayType::get(types._float4, max_vs_input_register)->getPointerTo()
     );
-    resource_map.input_element_count = max_input_register;
+    resource_map.input_element_count = max_vs_input_register;
 
     // of type "output_reg_per_point_type"
     resource_map.output.ptr_int4 = builder.CreateGEP(
@@ -415,7 +412,7 @@ convert_dxbc_vertex_hull_shader(
         resource_map.output.ptr_int4, output_reg_per_point_type_float->getPointerTo(vertex_out->getAddressSpace())
     );
 
-    resource_map.output_element_count = max_output_register;
+    resource_map.output_element_count = max_vs_output_register;
 
     struct context ctx {
         .builder = builder,
@@ -439,11 +436,70 @@ convert_dxbc_vertex_hull_shader(
             ),
             builder.CreateICmp(llvm::CmpInst::ICMP_ULT, patch_id, patch_count)
         ),
-        active, vertex_stage_end
+        index_check, vertex_stage_end
     );
-    builder.SetInsertPoint(active);
+    builder.SetInsertPoint(index_check);
 
-    if (index_buffer_idx != ~0u) {
+    if (is_dynamic_ib) {
+      auto start_index = builder.CreateExtractValue(draw_arguments, 2);
+      auto index_format = builder.CreateExtractValue(draw_arguments, 5);
+      auto index_buffer = builder.CreateExtractValue(draw_arguments, 6);
+
+      auto no_index = llvm::BasicBlock::Create(context, "no_index", function);
+      auto r16_index = llvm::BasicBlock::Create(context, "r16_index", function);
+      auto r32_index = llvm::BasicBlock::Create(context, "r32_index", function);
+      auto finalize_index = llvm::BasicBlock::Create(context, "finalize_index", function);
+
+      auto switch_ = builder.CreateSwitch(index_format, no_index, 2);
+      switch_->addCase(air.getInt(42), r32_index);
+      switch_->addCase(air.getInt(57), r16_index);
+
+      builder.SetInsertPoint(finalize_index);
+      auto vertex_id = builder.CreatePHI(air.getIntTy(), 3);
+      resource_map.vertex_id = vertex_id;
+      builder.CreateBr(active);
+      {
+        builder.SetInsertPoint(no_index);
+        builder.CreateBr(finalize_index);
+        vertex_id->addIncoming(control_point_index, no_index);
+      }
+      {
+        builder.SetInsertPoint(r32_index);
+        auto loaded_r32 = builder.CreateLoad(
+            builder.getInt32Ty(),
+            builder.CreateGEP(
+                builder.getInt32Ty(),
+                builder.CreatePointerCast(
+                    index_buffer, builder.getInt32Ty()->getPointerTo((unsigned)air::AddressSpace::device)
+                ),
+                {builder.CreateAdd(start_index, control_point_index)}
+            )
+        );
+        vertex_id->addIncoming(loaded_r32, r32_index);
+        builder.CreateBr(finalize_index);
+      }
+      {
+        builder.SetInsertPoint(r16_index);
+        auto loaded_r16 = builder.CreateLoad(
+            builder.getInt16Ty(),
+            builder.CreateGEP(
+                builder.getInt16Ty(),
+                builder.CreatePointerCast(
+                    index_buffer, builder.getInt16Ty()->getPointerTo((unsigned)air::AddressSpace::device)
+                ),
+                {builder.CreateAdd(start_index, control_point_index)}
+            )
+        );
+        vertex_id->addIncoming(
+            builder.CreateSub(
+                builder.CreateZExt(builder.CreateAdd(loaded_r16, builder.getInt16(1)), types._int), air.getInt(1)
+            ),
+            r16_index
+        );
+        builder.CreateBr(finalize_index);
+      }
+
+    } else if (index_buffer_idx != ~0u) {
       auto start_index = builder.CreateExtractValue(draw_arguments, 2);
       auto index_buffer = function->getArg(index_buffer_idx);
       auto index_buffer_element_type = index_buffer->getType()->getNonOpaquePointerElementType();
@@ -454,9 +510,13 @@ convert_dxbc_vertex_hull_shader(
           )
       );
       resource_map.vertex_id = builder.CreateZExt(vertex_id, types._int);
+      builder.CreateBr(active);
     } else {
       resource_map.vertex_id = control_point_index;
+      builder.CreateBr(active);
     }
+
+    builder.SetInsertPoint(active);
 
     resource_map.base_vertex_id = builder.CreateExtractValue(draw_arguments, is_indexed_draw ? 3 : 2);
     resource_map.instance_id = instance_id;
@@ -464,17 +524,21 @@ convert_dxbc_vertex_hull_shader(
     resource_map.base_instance_id = builder.CreateExtractValue(draw_arguments, is_indexed_draw ? 4 : 3);
     resource_map.instance_id_with_base = builder.CreateAdd(resource_map.instance_id, resource_map.base_instance_id);
 
-    if (auto err = prologue.build(ctx).takeError()) {
+    IOHelper io(air, function, types, resource_map);
+
+    if (auto err = prologue.Run(io)) {
       return err;
     }
-    auto real_entry = convert_basicblocks(pVertexStage->entry(), ctx, epilogue_bb);
+    llvm::Expected<llvm::BasicBlock *> real_entry =
+        pVertexStage->dxil ? dxil::convert_basicblocks(pVertexStage->dxil_entry, ctx, epilogue_bb)
+                           : convert_basicblocks(pVertexStage->entry(), ctx, epilogue_bb);
     if (auto err = real_entry.takeError()) {
       return err;
     }
     builder.CreateBr(real_entry.get());
 
     builder.SetInsertPoint(epilogue_bb);
-    auto epilogue_result = epilogue.build(ctx);
+    auto epilogue_result = epilogue.Run(function->getReturnType(), io);
     if (auto err = epilogue_result.takeError()) {
       return err;
     }
@@ -488,14 +552,11 @@ convert_dxbc_vertex_hull_shader(
   {
 
     /* Hull Shader Zone */
-    auto shader_info = hull_shader_info;
     auto &resource_map = resource_map_hs;
     auto &prologue = prologue_hs;
     auto &epilogue = epilogue_hs;
 
     auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue_hull", function);
-
-    uint32_t vertex_max_output_register = max_vs_output_register;
 
     auto payload = builder.CreateBitCast(function->getArg(payload_idx), payload_struct_type->getPointerTo(6));
 
@@ -506,7 +567,7 @@ convert_dxbc_vertex_hull_shader(
     resource_map.input.ptr_float4 = builder.CreateBitCast(
         resource_map.input.ptr_int4, output_reg_per_patch_type_float->getPointerTo(vertex_out->getAddressSpace())
     );
-    resource_map.input_element_count = vertex_max_output_register;
+    resource_map.input_element_count = max_vs_output_register;
 
     resource_map.instance_id = instance_id;
 
@@ -517,11 +578,11 @@ convert_dxbc_vertex_hull_shader(
         builder.getInt32(32) // so all phases are effectively skipped
     );
 
-    if (shader_info.no_control_point_phase_passthrough) {
+    if (hull_shader_info.no_control_point_phase_passthrough) {
       // TODO: check this out carefully......
       assert(pHullStage->output_control_point_count != ~0u);
 
-      if (shader_info.output_control_point_read) {
+      if (hull_shader_info.output_control_point_read) {
         llvm::GlobalVariable *control_point_phase_out = new llvm::GlobalVariable(
             module, hs_output_per_group_type, false, llvm::GlobalValue::InternalLinkage,
             llvm::UndefValue::get(hs_output_per_group_type), "hull_control_point_phase_out", nullptr,
@@ -556,7 +617,7 @@ convert_dxbc_vertex_hull_shader(
       resource_map.output_element_count = max_hs_output_register;
     } else {
       /* since no control point phase */
-      if (vertex_max_output_register < max_hs_output_register) {
+      if (max_vs_output_register < max_hs_output_register) {
         return llvm::make_error<UnsupportedFeature>(
             "Hull shader has control point phase pass-through, but vertex shader "
             "output signature doesn't match hull shader input signature."
@@ -608,16 +669,52 @@ convert_dxbc_vertex_hull_shader(
     };
     dxbc::Converter dxbc(ctx.air, ctx, ctx.resource);
 
-    if (auto err = prologue.build(ctx).takeError()) {
+    IOHelper io(air, function, types, resource_map);
+
+    if (auto err = prologue.Run(io)) {
       return err;
     }
-    auto real_entry = convert_basicblocks(pHullStage->entry(), ctx, epilogue_bb);
+    llvm::Expected<llvm::BasicBlock *> real_entry =
+        pHullStage->dxil ? dxil::convert_basicblocks(pHullStage->dxil_entry, ctx, epilogue_bb)
+                         : convert_basicblocks(pHullStage->entry(), ctx, epilogue_bb);
     if (auto err = real_entry.takeError()) {
       return err;
     }
     builder.CreateBr(real_entry.get());
 
     builder.SetInsertPoint(epilogue_bb);
+
+    if (hull_shader_info.output_control_point_read || !hull_shader_info.no_control_point_phase_passthrough) {
+      // if fork/join phase reads control point phase output, or control point phase is absent
+      // then we need to perform a memcpy from threadgroup memory to payload memory
+      // otherwise output is written to payload memory directly
+      auto active = llvm::BasicBlock::Create(context, "write_control_point", function);
+      auto sync = llvm::BasicBlock::Create(context, "write_control_point_end", function);
+
+      builder.CreateCondBr(
+          ctx.builder.CreateICmp(
+              llvm::CmpInst::ICMP_ULT, ctx.resource.thread_id_in_patch,
+              ctx.builder.getInt32(pHullStage->output_control_point_count)
+          ),
+          active, sync
+      );
+      builder.SetInsertPoint(active);
+
+      auto src = ctx.resource.hull_cp_passthrough_src;
+      if (src->getType()->getNonOpaquePointerElementType() != ctx.resource.hull_cp_passthrough_type) {
+        src = builder.CreateBitCast(
+            src, ctx.resource.hull_cp_passthrough_type->getPointerTo(src->getType()->getPointerAddressSpace())
+        );
+      }
+      assert(src->getType()->getNonOpaquePointerElementType() == ctx.resource.hull_cp_passthrough_type);
+      builder.CreateStore(
+          builder.CreateLoad(ctx.resource.hull_cp_passthrough_type, src), ctx.resource.hull_cp_passthrough_dst
+      );
+
+      builder.CreateBr(sync);
+      builder.SetInsertPoint(sync);
+      ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+    }
 
     /* populate patch constant output */
 
@@ -631,7 +728,8 @@ convert_dxbc_vertex_hull_shader(
     );
 
     builder.SetInsertPoint(write_patch_constant);
-    if (auto err = epilogue.build(ctx).takeError()) {
+    auto epilogue_result = epilogue.Run(function->getReturnType(), io);
+    if (auto err = epilogue_result.takeError()) {
       return err;
     }
 
@@ -755,10 +853,8 @@ convert_dxbc_tesselator_domain_shader(
 
   auto [final_maxtessfactor, factor_int] = get_final_maxtessfactor(pHullStage, pArgs);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    return nullptr; // a mesh shader...
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -981,7 +1077,9 @@ convert_dxbc_tesselator_domain_shader(
     resource_map.domain = domain_bary;
   }
 
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, vertex_emit);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, vertex_emit)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, vertex_emit);
   if (auto err = real_entry.takeError()) {
     return err;
   }
@@ -992,10 +1090,9 @@ convert_dxbc_tesselator_domain_shader(
   auto vertex_id = actual_thread_index;
   auto primitive_id = actual_thread_index; // 
   MeshOutputContext gs_out_ctx{vertex_id, primitive_id};
+  IOHelper io(air, function, types, resource_map);
   for (auto &h : ds_output_handlers) {
-    if (auto err = h(gs_out_ctx).build(ctx).takeError()) {
-      return err;
-    }
+    h(gs_out_ctx, io);
   }
 
   for (auto x : llvm::enumerate(pShaderInternal->clip_distance_scalars)) {

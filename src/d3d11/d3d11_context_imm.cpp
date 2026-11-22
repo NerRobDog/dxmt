@@ -1,4 +1,5 @@
 #include "config/config.hpp"
+#include "d3d11_context_state.hpp"
 #include "d3d11_fence.hpp"
 #include "d3d11_private.h"
 #include "d3d11_query.hpp"
@@ -93,6 +94,11 @@ public:
       return S_OK;
     }
 
+    if (riid == __uuidof(ID3D11VideoContext)) {
+      WARN("QueryInterface: ID3D11VideoContext requested, not implemented");
+      return E_NOINTERFACE;
+    }
+
     return ImmediateContextBase::QueryInterface(riid, ppvObject);
   }
 
@@ -139,13 +145,15 @@ public:
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
-    if (unlikely(!pResource || !pMappedResource))
+    if (unlikely(!pResource))
       return E_INVALIDARG;
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     auto current_seq_id = cmd_queue.CurrentSeqId();
     auto coherent_seq_id = cmd_queue.CoherentSeqId();
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -181,6 +189,8 @@ public:
       return S_OK;
     }
     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -201,6 +211,8 @@ public:
       return S_OK;
     }
     if (auto dynamic = GetDynamicLinearTexture(pResource, &row_pitch, &depth_pitch)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -232,8 +244,11 @@ public:
       return S_OK;
     }
     if (auto staging = GetStagingResource(pResource, Subresource)) {
+      if (!pMappedResource)
+        return E_INVALIDARG;
+
       if (MapType > 3 || MapType == 0)
-          return E_INVALIDARG;
+        return E_INVALIDARG;
 
       if (ignore_map_flag_no_wait_)
         MapFlags &= ~D3D11_MAP_FLAG_DO_NOT_WAIT;
@@ -578,6 +593,7 @@ public:
 
   virtual void
   WaitUntilGPUIdle() override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     uint64_t seq = cmd_queue.CurrentSeqId();
     if(!InvalidateCurrentPass())
       Commit();
@@ -593,6 +609,7 @@ public:
   };
 
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
     InvalidateCurrentPass();
@@ -605,6 +622,7 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *pFence, UINT64 Value) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
     Flush();
@@ -619,6 +637,32 @@ public:
   STDMETHODCALLTYPE
   GetContextFlags() override {
     return 0;
+  }
+
+  void
+  STDMETHODCALLTYPE
+  SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
+    InitReturnPtr(ppPreviousState);
+
+    if (!pState)
+      return;
+
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    ResetEncodingContextState();
+
+    if (!state_object_)
+      state_object_ = new MTLD3D11DeviceContextState(device);
+    
+    state_object_->state = std::move(state_);
+
+    if (ppPreviousState)
+      *ppPreviousState = state_object_.ref();
+
+    state_object_ = static_cast<MTLD3D11DeviceContextState *>(pState);
+    state_ = std::move(state_object_->state);
+    
+    RestoreEncodingContextState();
   }
 
   HRESULT
@@ -663,6 +707,7 @@ private:
   std::atomic<uint32_t> refcount = 0;
   D3D11Multithread d3dmt_;
   bool ignore_map_flag_no_wait_;
+  Com<MTLD3D11DeviceContextState, false> state_object_;
 };
 
 std::unique_ptr<MTLD3D11DeviceContextBase>

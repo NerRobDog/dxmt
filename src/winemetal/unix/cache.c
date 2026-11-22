@@ -103,7 +103,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
   if ((self = [super init])) {
     NSString *dbPath = resolve_cache_dir(path, true);
     if (!dbPath) {
-      NSLog(@"[CacheReader] Failed to resolve cache path");
+      NSLog(@"[CacheWriter] Failed to resolve cache path");
       return nil;
     }
 
@@ -235,12 +235,12 @@ _WMTSetMetalShaderCachePath(void *obj) {
   params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
   [path release];
   return 0;
-};
+}
 
 #else
 
 int
-WMTSetMetalShaderCachePath(void *obj) {
+_WMTSetMetalShaderCachePath(void *obj) {
   struct unixcall_setmetalcachepath *params = obj;
   params->ret_success = 0;
   return 0;

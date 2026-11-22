@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 24
+#define AIRCONV_VERSION 26
 
 #ifdef __cplusplus
 #include <string>
@@ -94,6 +94,11 @@ struct MTL_POST_TESSELLATOR_REFLECTION {
   uint32_t MaxPotentialTessFactor;
 };
 
+struct MTL_PIXEL_SHADER_REFLECTION {
+  uint32_t ValidRenderTargets;
+  uint32_t HasCoverageOutput;
+};
+
 struct MTL_SHADER_REFLECTION {
   uint32_t ConstanttBufferTableBindIndex;
   uint32_t ArgumentBufferBindIndex;
@@ -104,7 +109,11 @@ struct MTL_SHADER_REFLECTION {
     struct MTL_TESSELLATOR_REFLECTION Tessellator;
     struct MTL_GEOMETRY_SHADER_REFLECTION GeometryShader;
     struct MTL_POST_TESSELLATOR_REFLECTION PostTessellator;
+    /**
+    \deprecated for compatibility, use PixelShader.ValidRenderTargets instead
+     */
     uint32_t PSValidRenderTargets;
+    struct MTL_PIXEL_SHADER_REFLECTION PixelShader;
   };
   uint16_t ConstantBufferSlotMask;
   uint16_t SamplerSlotMask;
@@ -194,6 +203,7 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   SM50_SHADER_PSO_GEOMETRY_SHADER = 6,
   SM50_SHADER_PSO_TESSELLATOR = 7,
   SM50_SHADER_ROOT_SIGNATURE = 8,
+  SM50_SHADER_ROOT_SIGNATURE2 = 9,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -261,6 +271,7 @@ enum SM50_INDEX_BUFFER_FORMAT {
   SM50_INDEX_BUFFER_FORMAT_NONE = 0,
   SM50_INDEX_BUFFER_FORMAT_UINT16 = 1,
   SM50_INDEX_BUFFER_FORMAT_UINT32 = 2,
+  SM50_INDEX_BUFFER_FORMAT_DYNAMIC = 3,
 };
 
 struct SM50_SHADER_IA_INPUT_LAYOUT_DATA {
