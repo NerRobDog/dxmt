@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "dxil_converter.hpp"
 #include "metallib_writer.hpp"
 #include "nt/air_builder.hpp"
 #include "shader_common.hpp"
@@ -29,11 +30,6 @@
 class SM50CompiledBitcodeInternal {
 public:
   llvm::SmallVector<char, 0> vec;
-};
-
-class SM50ErrorInternal {
-public:
-  llvm::SmallVector<char, 0> buf;
 };
 
 namespace dxmt::dxbc {
@@ -196,9 +192,6 @@ void setup_temp_register(
       ptr_int_vec, ptr_float_vec, (uint32_t)channel_count
     };
   }
-  if (shader_info->use_cmp_exch) {
-    resource_map.cmp_exch_temp = builder.CreateAlloca(types._int);
-  }
 }
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
@@ -350,14 +343,8 @@ llvm::Error convert_dxbc_pixel_shader(
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::ConstantAggregateZero::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -368,6 +355,7 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
+    sig_ctx.pso_sample_mask = pso_sample_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
     for (auto &p : pShaderInternal->signature_handlers) {
@@ -377,16 +365,9 @@ llvm::Error convert_dxbc_pixel_shader(
   if (pso_sample_mask != 0xffffffff) {
     auto assigned_index =
       func_signature.DefineOutput(air::OutputCoverageMask{});
-    epilogue >> [=](pvalue value) -> IRValue {
-      return make_irvalue([=](struct context ctx) {
-        auto &builder = ctx.builder;
-        if (ctx.resource.coverage_mask_reg)
-          return value;
-        return builder.CreateInsertValue(
-          value, builder.getInt32(ctx.pso_sample_mask), {assigned_index}
-        );
-      });
-    };
+    epilogue.Add([=](llvm::Value *value, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+      return io.PopulateDefaultCoverageMask(value, assigned_index, pso_sample_mask);
+    });
   }
 
   auto binding_map = rootsig ? setup_binding_rootsig(
@@ -447,17 +428,21 @@ llvm::Error convert_dxbc_pixel_shader(
       .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  auto epilogue_result = epilogue.build(ctx);
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
@@ -494,14 +479,8 @@ llvm::Error convert_dxbc_compute_shader(
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::ConstantAggregateZero::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -555,10 +534,14 @@ llvm::Error convert_dxbc_compute_shader(
       .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
@@ -566,7 +549,8 @@ llvm::Error convert_dxbc_compute_shader(
 
   builder.SetInsertPoint(epilogue_bb);
 
-  if (auto err = epilogue.build(ctx).takeError()) {
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
+  if (auto err = epilogue_result.takeError()) {
     return err;
   }
   builder.CreateRetVoid();
@@ -609,14 +593,8 @@ llvm::Error convert_dxbc_vertex_shader(
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::ConstantAggregateZero::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -650,44 +628,8 @@ llvm::Error convert_dxbc_vertex_shader(
       .arg_name = "stream_outputs",
       .raster_order_group = {}
     });
-    epilogue << make_irvalue([=](struct context ctx) {
-      auto &builder = ctx.builder;
-      auto base_vertex = ctx.function->getArg(bv);
-      auto vertex_id = ctx.function->getArg(vid);
-      auto so_entries_type = ctx.types._dxmt_stream_output_buffer_entry;
-      auto so_entries = builder.CreateBitCast(
-          ctx.function->getArg(so_table), so_entries_type->getPointerTo((uint32_t)air::AddressSpace::constant)
-      );
-      auto slot0_entry =
-          builder.CreateLoad(so_entries_type, builder.CreateConstInBoundsGEP1_32(so_entries_type, so_entries, 0));
-      auto slot0 = builder.CreateExtractValue(slot0_entry, {0});
-      auto adjusted_vertex_id = builder.CreateSub(vertex_id, base_vertex);
-      auto output_regs = builder.CreateBitOrPointerCast(
-        ctx.resource.output.ptr_int4, llvm::PointerType::get(ctx.types._int, 0)
-      );
-      for (unsigned i = 0; i < vertex_so->num_elements; i++) {
-        auto &element = vertex_so->elements[i];
-        if (element.reg_id == 0xffffffff)
-          continue;
-        auto ptr = ctx.builder.CreateConstGEP1_32(
-          ctx.types._int, output_regs,
-          (unsigned)(element.reg_id * 4 + element.component)
-        );
-        auto target_offset = ctx.builder.CreateAdd(
-          ctx.builder.CreateMul(
-            adjusted_vertex_id,
-            ctx.builder.getInt32(vertex_so->strides[element.output_slot /* expected to be 0 */])
-          ),
-          ctx.builder.getInt32(element.offset)
-        );
-        auto target_ptr = ctx.builder.CreateGEP(
-          ctx.types._int, slot0, {ctx.builder.CreateLShr(target_offset, 2)}
-        );
-        ctx.builder.CreateStore(
-          ctx.builder.CreateLoad(ctx.types._int, ptr), target_ptr, true
-        );
-      }
-      return nullptr;
+    epilogue.Add([=](llvm::Value *value, IOHelper &io) -> llvm::Expected<llvm::Value *> {
+      return io.PopulateOutputStreamOutput(value, vertex_so, bv, vid, so_table);
     });
   }
 
@@ -785,17 +727,21 @@ llvm::Error convert_dxbc_vertex_shader(
       .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  auto epilogue_result = epilogue.build(ctx);
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
@@ -992,21 +938,26 @@ AIRCONV_API int SM50Initialize(
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
 
   if (ppShader == nullptr) {
     errorOut << "ppShader can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
+
+  UINT32 dxilBlobIdx = DXBCParser.FindNextMatchingBlob(microsoft::DXBC_DXIL, 0);
+  if (dxilBlobIdx != DXBC_BLOB_NOT_FOUND)
+    return dxmt::dxil::initialize(
+      DXBCParser.GetBlob(dxilBlobIdx), DXBCParser.GetBlobSize(dxilBlobIdx), ppShader,
+      pRefl, ppError
+    );
 
   UINT codeBlobIdx = DXBCParser.FindNextMatchingBlob(DXBC_GenericShaderEx);
   if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
@@ -1014,8 +965,7 @@ AIRCONV_API int SM50Initialize(
   }
   if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
     errorOut << "Invalid DXBC bytecode: shader blob not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
   const void *codeBlob = DXBCParser.GetBlob(codeBlobIdx);
 
@@ -1025,17 +975,15 @@ AIRCONV_API int SM50Initialize(
   CSignatureParser inputParser;
   if (DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: input signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
   CSignatureParser5 outputParser;
   if (DXBCGetOutputSignature(pBytecode, &outputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: output signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  auto sm50_shader = new SM50ShaderInternal();
+  auto sm50_shader = std::make_unique<SM50ShaderInternal>();
   sm50_shader->shader_type = CodeParser.ShaderType();
   auto shader_info = &(sm50_shader->shader_info);
 
@@ -1047,7 +995,7 @@ AIRCONV_API int SM50Initialize(
     }
   }
 
-  sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
+  sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader.get(), inputParser, outputParser);
 
   auto &binding_table = shader_info->binding_table;
   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
@@ -1252,20 +1200,18 @@ AIRCONV_API int SM50Initialize(
       auto threads_per_patch = next_pow2(sm50_shader->hull_maximum_threads_per_patch);
       if (threads_per_patch > 32) {
         errorOut << "Threadgroup size of tessellation pipeline is too large.";
-        *ppError = (sm50_error_t)errorObj;
-        return 1;
+        SM50_RETURN_ERROR(errorObj, ppError, 1);
       }
       auto patch_per_group = 32 / threads_per_patch;
       float max_tesselation_factor = sm50_shader->max_tesselation_factor;
 
-      while (estimate_payload_size(sm50_shader, max_tesselation_factor, patch_per_group) > 16384) {
+      while (estimate_payload_size(sm50_shader.get(), max_tesselation_factor, patch_per_group) > 16384) {
         if (patch_per_group == 1) {
           if (max_tesselation_factor > 1.0f) {
             max_tesselation_factor = std::max(max_tesselation_factor - 2.0f, 1.0f);
           } else {
             errorOut << "Payload size of tessellation pipeline is too large.";
-            *ppError = (sm50_error_t)errorObj;
-            return 1;
+            SM50_RETURN_ERROR(errorObj, ppError, 1);
           }
         } else {
           patch_per_group = patch_per_group >> 1;
@@ -1286,7 +1232,7 @@ AIRCONV_API int SM50Initialize(
       uint32_t max_potential_tess_factor = 1;
 
       for (int tess_factor = 1; tess_factor <= 64; tess_factor++) {
-        auto x = estimate_mesh_size(sm50_shader, tess_factor);
+        auto x = estimate_mesh_size(sm50_shader.get(), tess_factor);
         if (x > 32768)
           break;
         max_potential_tess_factor = tess_factor;
@@ -1295,25 +1241,23 @@ AIRCONV_API int SM50Initialize(
       pRefl->PostTessellator = {.MaxPotentialTessFactor = max_potential_tess_factor};
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER) {
-      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask ||
-          binding_srv_hi_mask || binding_srv_lo_mask ||
-          !CheckGSBBIsPassThrough(sm50_shader->entry())) {
+      if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask || binding_srv_hi_mask ||
+          binding_srv_lo_mask ||
+          !(CheckGSBBIsPassThrough(sm50_shader->entry()) &&
+            CheckGSSignatureIsPassThrough(inputParser, outputParser, pRefl->GeometryShader.Data))) {
         pRefl->GeometryShader.GSPassThrough = ~0u;
-      } else {
-        CheckGSSignatureIsPassThrough(
-          inputParser, outputParser, pRefl->GeometryShader.Data
-        );
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
-      pRefl->PSValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
+      pRefl->PixelShader.ValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
+      pRefl->PixelShader.HasCoverageOutput = sm50_shader->ps_has_coverage_output;
     }
     pRefl->NumOutputElement = sm50_shader->max_output_register;
     pRefl->ArgumentTableQwords = binding_table.Size();
   }
 
-  *ppShader = sm50_shader;
+  *ppShader = (sm50_shader_t)sm50_shader.release();
   return 0;
 };
 
@@ -1346,22 +1290,21 @@ AIRCONV_API int SM50Compile(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
 
@@ -1371,11 +1314,8 @@ AIRCONV_API int SM50Compile(
   if (auto err = dxmt::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1407,22 +1347,21 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
@@ -1434,11 +1373,8 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
         FunctionName, context, *pModule, pHullShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1471,22 +1407,21 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
@@ -1499,11 +1434,8 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
         (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule,
         pDomainShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1536,22 +1468,21 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
@@ -1563,11 +1494,8 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
         (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
         pVertexShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1599,22 +1527,21 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 ) {
   using namespace llvm;
   using namespace dxmt;
+  using namespace dxmt::dxbc;
 
   if (ppError) {
     *ppError = nullptr;
   }
-  auto errorObj = new SM50ErrorInternal();
+  auto errorObj = std::make_unique<SM50ErrorInternal>();
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  // pArgs is ignored for now
   LLVMContext context;
 
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
@@ -1627,11 +1554,8 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
         (dxbc::SM50ShaderInternal *)pVertexShader, context, *pModule,
         pGeometryShaderArgs
       )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    *ppError = (sm50_error_t)errorObj;
-    return 1;
+    errorOut << llvm::toString(std::move(err));
+    SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
   if (shader_info.use_msad)
@@ -1670,7 +1594,7 @@ AIRCONV_API void SM50DestroyBitcode(sm50_bitcode_t pBitcode) {
 }
 
 AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_t BufferSize) {
-  auto pInternal = (SM50ErrorInternal *)pError;
+  auto pInternal = (dxmt::dxbc::SM50ErrorInternal *)pError;
   auto str_len = std::min(pInternal->buf.size(), BufferSize - 1);
   memcpy(pBuffer, pInternal->buf.data(), str_len);
   pBuffer[str_len] = '\0';
@@ -1680,6 +1604,6 @@ AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_
 AIRCONV_API void SM50FreeError(sm50_error_t pError) {
   if (pError == nullptr)
     return;
-  auto pInternal = (SM50ErrorInternal *)pError;
+  auto pInternal = (dxmt::dxbc::SM50ErrorInternal *)pError;
   delete pInternal;
 }

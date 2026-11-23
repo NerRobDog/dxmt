@@ -72,7 +72,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   friend struct SimpleCommandContext<MTLD3D12CommandAllocatorImpl>;
 
   D3D12_COMMAND_LIST_TYPE type_;
-  
+
+  std::vector<void *> spilled_cpu_heap_;
   void *cpu_heap_ = nullptr;
   size_t cpu_heap_offset_;
 
@@ -90,6 +91,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   small_vector<WMT::Reference<WMT::IndirectCommandBuffer>, 4> icb_;
 
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
+  ClearRTV<MTLD3D12CommandAllocatorImpl> clear_rtv_;
 
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator_;
   uint64_t copy_temp_version_;
@@ -152,11 +154,19 @@ public:
 
   void *
   AllocateCPUHeap(size_t Length, size_t Alignment) {
-    std::size_t adjustment = align_forward_adjustment((void *)cpu_heap_offset_, Alignment);
-    auto aligned = cpu_heap_offset_ + adjustment;
-    cpu_heap_offset_ = aligned + Length;
-    assert(cpu_heap_offset_ < kCPUHeapSize);
-    return ptr_add(cpu_heap_, aligned);
+    assert(Length < kCPUHeapSize);
+    for (;;) {
+      std::size_t adjustment = align_forward_adjustment((void *)cpu_heap_offset_, Alignment);
+      auto aligned = cpu_heap_offset_ + adjustment;
+      cpu_heap_offset_ = aligned + Length;
+      if (unlikely(cpu_heap_offset_ >= kCPUHeapSize)) {
+        spilled_cpu_heap_.push_back(cpu_heap_);
+        cpu_heap_ = malloc(kCPUHeapSize);
+        cpu_heap_offset_ = 0;
+        continue;
+      }
+      return ptr_add(cpu_heap_, aligned);
+    }
   }
 
   template <typename T>

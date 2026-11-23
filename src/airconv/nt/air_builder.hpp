@@ -63,6 +63,8 @@ public:
     sample_int,
     sample_uint,
     sample_half,
+    sample_short,
+    sample_ushort,
   };
 
   enum MemoryAccess {
@@ -239,6 +241,8 @@ public:
 
   Value *CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Query Query, Value *Level);
 
+  Value *CreateCalculateLOD(const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, bool Clamped);
+
   /**
   \returns (float clamped_lod, float unclamped_lod)
   */
@@ -256,9 +260,45 @@ public:
 
   /* Compute Shader */
 
+  Value *CreateGetGroupID(uint32_t Component);
+
+  Value *CreateGetGlobalID(uint32_t Component);
+
+  Value *CreateGetLocalID(uint32_t Component);
+
+  Value *CreateGetLocalLinearID();
+
+  Value *CreateGetBuiltinID(llvm::StringRef Name, uint32_t Component);
+
+  Value *CreateGetBuiltinID(llvm::StringRef Name);
+
   CallInst *CreateBarrier(MemFlags Flags, bool SimdGroup = false);
 
   CallInst *CreateAtomicFence(MemFlags Flags, ThreadScope Scope, bool Relaxed = false);
+
+  CallInst *CreateShuffle(Value *ShuffleValue, Value *LaneId, bool Quad = false);
+
+  CallInst *CreateQuadShuffleXor(Value *ShuffleValue, uint16_t Mask);
+
+  CallInst *CreateSIMDAllAny(Value *Expr, bool Any);
+
+  CallInst *CreateSIMDIsFirst();
+
+  enum SIMDOp {
+    simd_sum,
+    simd_product,
+    simd_min,
+    simd_max,
+    simd_and,
+    simd_or,
+    simd_xor,
+  };
+
+  CallInst *CreateSIMDOp(SIMDOp Op, Value *Operand, bool Signed, bool Prefix = false, bool InclusivePrefix = false);
+
+  CallInst *CreateSIMDBallot(Value *Cond);
+
+  CallInst *CreateSIMDBroadcastFirst(Value *Operand);
 
   /* Math */
 
@@ -298,6 +338,8 @@ public:
 
   CallInst *CreateSetMeshViewportArrayIndex(Value *Vertex, Value *ArrayIndex);
 
+  CallInst *CreateSetMeshPrimitiveID(Value *Vertex, Value *ID);
+
   CallInst *CreateSetMeshPosition(Value *Vertex, Value *Position);
 
   CallInst *CreateSetMeshClipDistance(Value *Vertex, Value *Index, Value *Value);
@@ -331,11 +373,24 @@ public:
     cos,
     sin,
     fabs,
+    tan,
+    acos,
+    asin,
+    atan,
+    hcos,
+    hsin,
+    htan,
   };
 
   Value *CreateFPUnOp(FPUnOp Op, Value *Operand, bool FastVariant = true);
 
   Value *CreateIsNaN(Value *Operand);
+
+  Value *CreateIsFinite(Value *Operand);
+
+  Value *CreateIsInfinite(Value *Operand);
+
+  Value *CreateIsNormal(Value *Operand);
 
   enum FPBinOp {
     fmax,
@@ -600,8 +655,10 @@ protected:
   getTexelSign(const Texture &Texture) {
     switch (Texture.sample_type) {
     case Texture::sample_int:
+    case Texture::sample_short:
       return Signedness::Signed;
     case Texture::sample_uint:
+    case Texture::sample_ushort:
       return Signedness::Unsigned;
     default:
       return Signedness::DontCare;

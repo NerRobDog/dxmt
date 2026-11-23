@@ -658,15 +658,7 @@ read_control_flow(
   }
 
   if (bb_current != bb_return) {
-    // if fork/join phase reads control point phase output, or control point phase is absent
-    // then we need to perform a memcpy from threadgroup memory to payload memory
-    // otherwise output is written to payload memory directly
-    if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER &&
-        (shader_info.output_control_point_read || !shader_info.no_control_point_phase_passthrough)) {
-      bb_current->target = BasicBlockHullShaderWriteOutput{sm50_shader->output_control_point_count, bb_return};
-    } else {
-      bb_current->target = BasicBlockUnconditionalBranch{bb_return};
-    }
+    bb_current->target = BasicBlockUnconditionalBranch{bb_return};
     bb_current = bb_return;
   }
 
@@ -690,6 +682,7 @@ read_control_flow(
         return cloned;
       };
 
+      auto call_return_point = call->return_point;
       bb->target = BasicBlockUnconditionalBranch{clone(func_entries.at(call->func_id))};
 
       while (!block_to_redirect.empty()) {
@@ -699,8 +692,8 @@ read_control_flow(
         cloned->target = std::visit(
             patterns{
                 [](BasicBlockUndefined) -> BasicBlockTarget { return BasicBlockUndefined{}; },
-                [&](BasicBlockReturn ret) -> BasicBlockTarget {
-                  return BasicBlockUnconditionalBranch{call->return_point};
+                [=](BasicBlockReturn ret) -> BasicBlockTarget {
+                  return BasicBlockUnconditionalBranch{call_return_point};
                 },
                 [&](BasicBlockUnconditionalBranch uncond) -> BasicBlockTarget {
                   return BasicBlockUnconditionalBranch{clone(uncond.target)};
@@ -721,9 +714,6 @@ read_control_flow(
                   return BasicBlockInstanceBarrier{
                       instance.instance_count, clone(instance.active), clone(instance.sync)
                   };
-                },
-                [&](BasicBlockHullShaderWriteOutput hull_end) -> BasicBlockTarget {
-                  return BasicBlockHullShaderWriteOutput{hull_end.instance_count, clone(hull_end.epilogue)};
                 },
                 [&](BasicBlockCall call) -> BasicBlockTarget {
                   if (stack_depth == 1)

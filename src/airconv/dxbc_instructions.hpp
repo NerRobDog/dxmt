@@ -80,6 +80,10 @@ struct IndexByTempComponent {
   uint32_t offset;
 };
 
+struct IndexByControlPointId {
+  uint32_t offset;
+};
+
 struct IndexByIndexableTempComponent {
   uint32_t regfile;
   uint32_t regid;
@@ -88,8 +92,8 @@ struct IndexByIndexableTempComponent {
   uint32_t offset;
 };
 
-using OperandIndex =
-  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent>;
+using OperandIndex = std::variant<uint32_t, IndexByIndexableTempComponent,
+                                  IndexByTempComponent, IndexByControlPointId>;
 #pragma endregion
 
 enum class OperandDataType {
@@ -142,14 +146,14 @@ struct SrcOperandInputOCP {
   static constexpr std::string_view debug_name = "input_vocp";
   SrcOperandCommon _;
   OperandIndex cpid;
-  uint32_t regid;
+  OperandIndex regid;
 };
 
 struct SrcOperandInputICP {
   static constexpr std::string_view debug_name = "input_vicp";
   SrcOperandCommon _;
   OperandIndex cpid;
-  uint32_t regid;
+  OperandIndex regid;
 };
 
 struct SrcOperandInputPC {
@@ -807,11 +811,6 @@ struct BasicBlockUnconditionalBranch {
   BasicBlock *target;
 };
 
-struct BasicBlockHullShaderWriteOutput {
-  uint32_t instance_count;
-  BasicBlock *epilogue;
-};
-
 struct BasicBlockSwitch {
   SrcOperand value;
   std::map<uint32_t, BasicBlock *> cases;
@@ -835,7 +834,7 @@ struct BasicBlockCall {
 
 using BasicBlockTarget = std::variant<
   BasicBlockConditionalBranch, BasicBlockUnconditionalBranch, BasicBlockSwitch,
-  BasicBlockReturn, BasicBlockInstanceBarrier, BasicBlockHullShaderWriteOutput,
+  BasicBlockReturn, BasicBlockInstanceBarrier,
   BasicBlockCall, BasicBlockUndefined>;
 
 class BasicBlock {

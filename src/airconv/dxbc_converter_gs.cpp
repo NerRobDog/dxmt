@@ -1,7 +1,7 @@
-#include "air_operations.hpp"
 #include "air_signature.hpp"
 #include "airconv_error.hpp"
 #include "dxbc_converter.hpp"
+#include "dxil_converter.hpp"
 #include "nt/air_builder.hpp"
 #include "llvm/IR/Constants.h"
 #include "llvm/Support/Alignment.h"
@@ -121,8 +121,8 @@ convert_dxbc_geometry_shader(
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue { return nullptr; });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -152,6 +152,7 @@ convert_dxbc_geometry_shader(
     topology = air::MeshOutputTopology::Line;
     break;
   case microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST:
+    func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
     break;
   default:
     return llvm::make_error<UnsupportedFeature>("unsupported geometry shader output topology");
@@ -216,8 +217,10 @@ convert_dxbc_geometry_shader(
     }
   };
 
+  IOHelper io(air, function, types, resource_map);
+
   if (topology == air::MeshOutputTopology::Triangle) {
-    resource_map.call_emit = [&]() -> IREffect {
+    resource_map.call_emit = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
       auto current_vertex_offset = builder.CreateLoad(types._int, vertex_offset);
       auto current_vertex_with_offset = builder.CreateAdd(current_vertex_offset, current_write_vertex);
@@ -231,7 +234,7 @@ convert_dxbc_geometry_shader(
 
       MeshOutputContext gs_out_ctx{current_vertex_with_offset, current_primitive_idx};
       for (auto &h : gs_output_handlers) {
-        co_yield h(gs_out_ctx);
+        h(gs_out_ctx, io);
       }
       emit_clip_distances(current_vertex_with_offset);
 
@@ -249,10 +252,8 @@ convert_dxbc_geometry_shader(
       );
 
       builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
-
-      co_return {};
     };
-    resource_map.call_cut = [&]() -> IREffect {
+    resource_map.call_cut = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
       builder.CreateStore(zero_const, next_write_vertex);
 
@@ -267,10 +268,9 @@ convert_dxbc_geometry_shader(
       builder.CreateStore(
           builder.CreateAdd(builder.CreateLoad(types._int, primitive_count), add_primitive_count), primitive_count
       );
-      co_return {};
     };
   } else if (topology == air::MeshOutputTopology::Line) {
-    resource_map.call_emit = [&]() -> IREffect {
+    resource_map.call_emit = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
       builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
 
@@ -282,7 +282,7 @@ convert_dxbc_geometry_shader(
 
       MeshOutputContext gs_out_ctx{current_vertex_with_offset, current_primitive_idx};
       for (auto &h : gs_output_handlers) {
-        co_yield h(gs_out_ctx);
+        h(gs_out_ctx, io);
       }
       emit_clip_distances(current_vertex_with_offset);
 
@@ -294,10 +294,8 @@ convert_dxbc_geometry_shader(
           builder.CreateAdd(double_primitive_idx, one_const),
           builder.CreateAdd(current_vertex_with_offset, one_const)
       );
-
-      co_return {};
     };
-    resource_map.call_cut = [&]() -> IREffect {
+    resource_map.call_cut = [&]() {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
       builder.CreateStore(zero_const, next_write_vertex);
 
@@ -312,25 +310,23 @@ convert_dxbc_geometry_shader(
       builder.CreateStore(
           builder.CreateAdd(builder.CreateLoad(types._int, primitive_count), add_primitive_count), primitive_count
       );
-      co_return {};
     };
   } else {
-    resource_map.call_emit = [&]() -> IREffect {
+    resource_map.call_emit = [&]() {
       // only one accumulator to maintain, simple one ~
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
       builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
 
       MeshOutputContext gs_out_ctx{current_write_vertex, current_write_vertex};
       for (auto &h : gs_output_handlers) {
-        co_yield h(gs_out_ctx);
+        h(gs_out_ctx, io);
       }
       emit_clip_distances(current_write_vertex);
+      air.CreateSetMeshPointSize(current_write_vertex, air.getFloat(1.0));
       air.CreateSetMeshIndex(current_write_vertex, current_write_vertex);
-      co_return {};
     };
-    resource_map.call_cut = []() -> IREffect {
+    resource_map.call_cut = []() {
       // there is nothing to cut!
-      co_return {};
     };
   }
 
@@ -492,24 +488,28 @@ convert_dxbc_geometry_shader(
       .metal_version = metal_version,
   };
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  if (auto err = prologue.Run(io)) {
     return err;
   }
 
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry,  ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
   builder.CreateBr(real_entry.get());
   builder.SetInsertPoint(epilogue_bb);
 
-  if (auto err = epilogue.build(ctx).takeError()) {
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
+  if (auto err = epilogue_result.takeError()) {
     return err;
   }
-  if (auto err = resource_map.call_cut().build(ctx).takeError()) {
-    return err;
-  }
-  air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
+  resource_map.call_cut();
+  if (topology == air::MeshOutputTopology::Point)
+    air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, next_write_vertex));
+  else
+    air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
 
   builder.CreateRetVoid();
   module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
@@ -547,15 +547,10 @@ convert_dxbc_vertex_for_geometry_shader(
 
   bool is_triadj_strip = is_strip && pGeometryStage->gs_input_primitive == D3D10_SB_PRIMITIVE_TRIANGLE_ADJ;
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
+  bool is_dyanmic_ib = is_indexed_draw && ia_layout->index_buffer_format == SM50_INDEX_BUFFER_FORMAT_DYNAMIC;
 
-  IREffect prologue([](auto) { return std::monostate(); });
-  IRValue epilogue([](struct context ctx) -> pvalue {
-    auto retTy = ctx.function->getReturnType();
-    if (retTy->isVoidTy()) {
-      return nullptr;
-    }
-    return llvm::UndefValue::get(retTy);
-  });
+  Prologues prologue;
+  Epilogues epilogue;
 
   io_binding_map resource_map;
   air::AirType types(context);
@@ -589,14 +584,16 @@ convert_dxbc_vertex_for_geometry_shader(
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = is_indexed_draw //
-          ? air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
+          ? is_dyanmic_ib
+              ? air::MSLWhateverStruct{"draw_indexed_dynamic_arguments", types._dxmt_draw_dyn_ib_arguments}
+              : air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
           : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
       .arg_name = "draw_arguments",
       .raster_order_group = {}
   });
 
   uint32_t index_buffer_idx = ~0u;
-  if (is_indexed_draw) {
+  if (is_indexed_draw && !is_dyanmic_ib) {
     index_buffer_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
         .buffer_size = {},
         .location_index = SM50_BINDING_INDEX_INDEX_BUFFER,
@@ -640,7 +637,7 @@ convert_dxbc_vertex_for_geometry_shader(
   auto instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
 
   auto draw_arguments = builder.CreateLoad(
-    is_indexed_draw ? types._dxmt_draw_indexed_arguments
+    is_indexed_draw ? is_dyanmic_ib ? types._dxmt_draw_dyn_ib_arguments : types._dxmt_draw_indexed_arguments
                     : types._dxmt_draw_arguments,
     function->getArg(draw_argument_idx)
   );
@@ -735,7 +732,68 @@ convert_dxbc_vertex_for_geometry_shader(
   );
   builder.SetInsertPoint(index_check);
 
-  if (index_buffer_idx != ~0u) {
+  if (is_dyanmic_ib) {
+    auto start_index = builder.CreateExtractValue(draw_arguments, 2);
+    auto index_format = builder.CreateExtractValue(draw_arguments, 5);
+    auto index_buffer = builder.CreateExtractValue(draw_arguments, 6);
+
+    auto no_index = llvm::BasicBlock::Create(context, "no_index", function);
+    auto r16_index = llvm::BasicBlock::Create(context, "r16_index", function);
+    auto r32_index = llvm::BasicBlock::Create(context, "r32_index", function);
+    auto finalize_index = llvm::BasicBlock::Create(context, "finalize_index", function);
+
+    auto switch_ = builder.CreateSwitch(index_format, no_index, 2);
+    switch_->addCase(air.getInt(42), r32_index);
+    switch_->addCase(air.getInt(57), r16_index);
+
+    builder.SetInsertPoint(finalize_index);
+    auto vertex_id = builder.CreatePHI(air.getIntTy(), 3);
+    resource_map.vertex_id = vertex_id;
+    builder.CreateCondBr(
+        builder.CreateICmp(llvm::CmpInst::ICMP_NE, builder.getInt32(-1), vertex_id), active, will_dispatch
+    );
+    {
+      builder.SetInsertPoint(no_index);
+      builder.CreateBr(finalize_index);
+      vertex_id->addIncoming(global_index_id, no_index);
+    }
+    {
+      builder.SetInsertPoint(r32_index);
+      auto loaded_r32 = builder.CreateLoad(
+          builder.getInt32Ty(),
+          builder.CreateGEP(
+              builder.getInt32Ty(),
+              builder.CreatePointerCast(
+                  index_buffer, builder.getInt32Ty()->getPointerTo((unsigned)air::AddressSpace::device)
+              ),
+              {builder.CreateAdd(start_index, global_index_id)}
+          )
+      );
+      vertex_id->addIncoming(loaded_r32, r32_index);
+      builder.CreateBr(finalize_index);
+    }
+    {
+      builder.SetInsertPoint(r16_index);
+      auto loaded_r16 = builder.CreateLoad(
+          builder.getInt16Ty(),
+          builder.CreateGEP(
+              builder.getInt16Ty(),
+              builder.CreatePointerCast(
+                  index_buffer, builder.getInt16Ty()->getPointerTo((unsigned)air::AddressSpace::device)
+              ),
+              {builder.CreateAdd(start_index, global_index_id)}
+          )
+      );
+      vertex_id->addIncoming(
+          builder.CreateSub(
+              builder.CreateZExt(builder.CreateAdd(loaded_r16, builder.getInt16(1)), types._int), air.getInt(1)
+          ),
+          r16_index
+      );
+      builder.CreateBr(finalize_index);
+    }
+
+  } else if (index_buffer_idx != ~0u) {
     auto start_index = builder.CreateExtractValue(draw_arguments, 2);
     auto index_buffer = function->getArg(index_buffer_idx);
     auto index_buffer_element_type = index_buffer->getType()->getNonOpaquePointerElementType();
@@ -774,18 +832,22 @@ convert_dxbc_vertex_for_geometry_shader(
   resource_map.base_instance_id = builder.CreateExtractValue(draw_arguments, is_indexed_draw ? 4 : 3);
   resource_map.instance_id_with_base = builder.CreateAdd(resource_map.instance_id, resource_map.base_instance_id);
 
-  if (auto err = prologue.build(ctx).takeError()) {
+  IOHelper io(air, function, types, resource_map);
+
+  if (auto err = prologue.Run(io)) {
     return err;
   }
 
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  llvm::Expected<llvm::BasicBlock *> real_entry =
+      pShaderInternal->dxil ? dxil::convert_basicblocks(pShaderInternal->dxil_entry, ctx, epilogue_bb)
+                            : convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
   builder.CreateBr(real_entry.get());
 
   builder.SetInsertPoint(epilogue_bb);
-  auto epilogue_result = epilogue.build(ctx);
+  auto epilogue_result = epilogue.Run(function->getReturnType(), io);
   if (auto err = epilogue_result.takeError()) {
     return err;
   }
@@ -883,10 +945,3 @@ convert_dxbc_vertex_for_geometry_shader(
 };
 
 } // namespace dxmt::dxbc
-
-template <> struct environment_cast<::dxmt::dxbc::context, ::dxmt::air::AIRBuilderContext> {
-  ::dxmt::air::AIRBuilderContext
-  cast(const ::dxmt::dxbc::context &src) {
-    return {src.llvm, src.module, src.builder, src.types, src.air};
-  };
-};

@@ -377,8 +377,9 @@ public:
       desc.RenderTarget[i].RenderTargetWriteMask =
           pBlendStateDesc->RenderTarget[i].RenderTargetWriteMask;
     }
-    auto hr = CreateBlendState1(&desc, &pBlendState1);
-    *ppBlendState = pBlendState1;
+    auto hr = CreateBlendState1(&desc, ppBlendState ? &pBlendState1: nullptr);
+    if (ppBlendState)
+      *ppBlendState = pBlendState1;
     return hr;
   }
 
@@ -406,8 +407,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = 0;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState: nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -447,7 +449,8 @@ public:
       ID3D11DeviceContext **ppDeferredContext) override{
     ID3D11DeviceContext3 *ppDeferredContext3;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
-    *ppDeferredContext = static_cast<ID3D11DeviceContext *>(ppDeferredContext3);
+    if (hr == S_OK)
+      *ppDeferredContext = static_cast<ID3D11DeviceContext *>(ppDeferredContext3);
     return hr;
   }
 
@@ -719,7 +722,8 @@ public:
       ID3D11DeviceContext1 **ppDeferredContext) override{
     ID3D11DeviceContext3 *ppDeferredContext3;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
-    *ppDeferredContext = static_cast<ID3D11DeviceContext1 *>(ppDeferredContext3);
+    if (hr == S_OK)
+      *ppDeferredContext = static_cast<ID3D11DeviceContext1 *>(ppDeferredContext3);
     return hr;
   }
 
@@ -747,8 +751,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = pRasterizerDesc->ForcedSampleCount;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState: nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -788,7 +793,8 @@ public:
   CreateDeferredContext2(UINT ContextFlags, ID3D11DeviceContext2 **ppDeferredContext) override {
     ID3D11DeviceContext3 *ppDeferredContext3;
     HRESULT hr = CreateDeferredContext3(ContextFlags, &ppDeferredContext3);
-    *ppDeferredContext = static_cast<ID3D11DeviceContext2 *>(ppDeferredContext3);
+    if (hr == S_OK)
+      *ppDeferredContext = static_cast<ID3D11DeviceContext2 *>(ppDeferredContext3);
     return hr;
   }
 
@@ -985,6 +991,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDeferredContext3(
     UINT ContextFlags, ID3D11DeviceContext3 **ppDeferredContext) override {
+    if (feature_flags_ & D3D11_CREATE_DEVICE_SINGLETHREADED)
+      return DXGI_ERROR_INVALID_CALL;
     *ppDeferredContext = std::move(dxmt::CreateDeferredContext(this, ContextFlags));
     return S_OK;
   }
@@ -1179,6 +1187,9 @@ public:
     }
 
     if (riid == __uuidof(ID3D10Device) || riid == __uuidof(ID3D10Device1)) {
+      if (!(d3d11_device_.feature_flags_ & 0x80000000)) {
+        return E_NOINTERFACE;
+      }
       *ppvObject = ref_and_cast<ID3D10Device>(d3d11_device_.d3d10_.get());
       return S_OK;
     }

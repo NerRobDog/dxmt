@@ -321,6 +321,7 @@ public:
   MTL_DXGI_FORMAT_DESC SrcFormat;
   MTL_DXGI_FORMAT_DESC DstFormat;
 
+  bool DimensionIncompatible;
   bool Invalid = true;
 
   TextureCopyCommand(
@@ -332,9 +333,8 @@ public:
       SrcSubresource(SrcSubresource),
       DstSubresource(DstSubresource),
       SrcFormat(Src_.FormatDescription),
-      DstFormat(Dst_.FormatDescription) {
-    if (Dst_.Dimension != Src_.Dimension)
-      return;
+      DstFormat(Dst_.FormatDescription),
+      DimensionIncompatible(Dst_.Dimension != Src_.Dimension) {
 
     if (SrcFormat.PixelFormat == WMTPixelFormatInvalid)
       return;
@@ -347,14 +347,7 @@ public:
     }
     case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
       D3D11_TEXTURE1D_DESC &dst_desc = Dst_.Texture1DDesc;
-      D3D11_TEXTURE1D_DESC &src_desc = Src_.Texture1DDesc;
-
-      Src.Format = src_desc.Format;
-      Src.MipLevel = SrcSubresource % src_desc.MipLevels;
-      Src.ArraySlice = SrcSubresource / src_desc.MipLevels;
-      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
-      Src.Height = 1;
-      Src.Depth = 1;
+      if (DstSubresource >= dst_desc.MipLevels * dst_desc.ArraySize) return;
 
       Dst.Format = dst_desc.Format;
       Dst.MipLevel = DstSubresource % dst_desc.MipLevels;
@@ -366,14 +359,7 @@ public:
     }
     case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
       D3D11_TEXTURE2D_DESC1 &dst_desc = Dst_.Texture2DDesc;
-      D3D11_TEXTURE2D_DESC1 &src_desc = Src_.Texture2DDesc;
-
-      Src.Format = src_desc.Format;
-      Src.MipLevel = SrcSubresource % src_desc.MipLevels;
-      Src.ArraySlice = SrcSubresource / src_desc.MipLevels;
-      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
-      Src.Height = std::max(1u, src_desc.Height >> Src.MipLevel);
-      Src.Depth = 1;
+      if (DstSubresource >= dst_desc.MipLevels * dst_desc.ArraySize) return;
 
       Dst.Format = dst_desc.Format;
       Dst.MipLevel = DstSubresource % dst_desc.MipLevels;
@@ -385,14 +371,7 @@ public:
     }
     case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
       D3D11_TEXTURE3D_DESC1 &dst_desc = Dst_.Texture3DDesc;
-      D3D11_TEXTURE3D_DESC1 &src_desc = Src_.Texture3DDesc;
-
-      Src.Format = src_desc.Format;
-      Src.MipLevel = SrcSubresource;
-      Src.ArraySlice = 0;
-      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
-      Src.Height = std::max(1u, src_desc.Height >> Src.MipLevel);
-      Src.Depth = std::max(1u, src_desc.Depth >> Src.MipLevel);
+      if (DstSubresource >= dst_desc.MipLevels) return;
 
       Dst.Format = dst_desc.Format;
       Dst.MipLevel = DstSubresource;
@@ -400,7 +379,50 @@ public:
       Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
       Dst.Height = std::max(1u, dst_desc.Height >> Dst.MipLevel);
       Dst.Depth = std::max(1u, dst_desc.Depth >> Dst.MipLevel);
+      break;
+    }
+    }
 
+    switch (Src_.Dimension) {
+    default: {
+      return;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
+      D3D11_TEXTURE1D_DESC &src_desc = Src_.Texture1DDesc;
+      if (SrcSubresource >= src_desc.MipLevels * src_desc.ArraySize) return;
+
+      Src.Format = src_desc.Format;
+      Src.MipLevel = SrcSubresource % src_desc.MipLevels;
+      Src.ArraySlice = SrcSubresource / src_desc.MipLevels;
+      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
+      Src.Height = 1;
+      Src.Depth = 1;
+
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+      D3D11_TEXTURE2D_DESC1 &src_desc = Src_.Texture2DDesc;
+      if (SrcSubresource >= src_desc.MipLevels * src_desc.ArraySize) return;
+
+      Src.Format = src_desc.Format;
+      Src.MipLevel = SrcSubresource % src_desc.MipLevels;
+      Src.ArraySlice = SrcSubresource / src_desc.MipLevels;
+      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
+      Src.Height = std::max(1u, src_desc.Height >> Src.MipLevel);
+      Src.Depth = 1;
+
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+      D3D11_TEXTURE3D_DESC1 &src_desc = Src_.Texture3DDesc;
+      if (SrcSubresource >= src_desc.MipLevels) return;
+
+      Src.Format = src_desc.Format;
+      Src.MipLevel = SrcSubresource;
+      Src.ArraySlice = 0;
+      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
+      Src.Height = std::max(1u, src_desc.Height >> Src.MipLevel);
+      Src.Depth = std::max(1u, src_desc.Depth >> Src.MipLevel);
       break;
     }
     }
@@ -833,8 +855,8 @@ public:
         return ClearRenderTargetView(rtv, Color);
       }
       InvalidateCurrentPass(true);
-      EmitST([texture = rtv->texture(), view = rtv->viewId()](ArgumentEncodingContext &enc) {
-        enc.clear_rt_cmd.begin(texture, view);
+      EmitST([texture = rtv->texture(), view = rtv->viewId(), plane = rtv->description().DepthPlane](ArgumentEncodingContext &enc) {
+        enc.clear_rt_cmd.begin(texture, view, plane);
       });
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
@@ -844,8 +866,8 @@ public:
         int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
-        EmitOP([=](ArgumentEncodingContext &enc) {
-          enc.clear_rt_cmd.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, color);
+        EmitOP([=, array_length = rtv->description().RenderTargetArrayLength](ArgumentEncodingContext &enc) {
+          enc.clear_rt_cmd.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, array_length, color);
         });
       }
       EmitST([](ArgumentEncodingContext &enc) { 
@@ -875,7 +897,7 @@ public:
       }
       InvalidateCurrentPass(true);
       EmitST([texture = dsv->texture(), view = dsv->viewId()](ArgumentEncodingContext &enc) {
-        enc.clear_rt_cmd.begin(texture, view);
+        enc.clear_rt_cmd.begin(texture, view, 0, D3D11_CLEAR_DEPTH);
       });
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
@@ -885,8 +907,8 @@ public:
         int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
-        EmitOP([=](ArgumentEncodingContext &enc) {
-          enc.clear_rt_cmd.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, color);
+        EmitOP([=, depth = color[0]](ArgumentEncodingContext &enc) {
+          enc.clear_rt_cmd.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, depth, 0);
         });
       }
       EmitST([](ArgumentEncodingContext &enc) { 
@@ -1110,6 +1132,8 @@ public:
       break;
     }
     default:
+      if (Src.Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+        return;
       CopyTexture(TextureCopyCommand(Dst, DstSubresource, DstX, DstY, DstZ, Src, SrcSubresource, pSrcBox));
       break;
     }
@@ -1879,12 +1903,6 @@ public:
   //-----------------------------------------------------------------------------
   // State Machine
   //-----------------------------------------------------------------------------
-
-  void
-  STDMETHODCALLTYPE
-  SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
-    UNIMPLEMENTED("SwapDeviceContextState");
-  }
 
   void
   STDMETHODCALLTYPE
@@ -3742,7 +3760,7 @@ public:
           entry.Offset = pOffsets[slot - StartSlot];
         } else {
           ERR("SetVertexBuffers: offset is null");
-          entry.Stride = 0;
+          entry.Offset = 0;
         }
         entry.Buffer = pVertexBuffer;
           EmitST([=, buffer = entry.Buffer->buffer(), offset = entry.Offset,
@@ -4018,7 +4036,7 @@ public:
           auto dst_format = dst_->pixelFormat();
           auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
           auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
-          if (Forget_sRGB(dst_format) != Forget_sRGB(src_format)) {
+          if (Forget_sRGB(dst_format) != Forget_sRGB(src_format) || cmd.DimensionIncompatible) {
 
             // bitcast, using a temporary buffer
             size_t bytes_per_row, bytes_per_image, bytes_total;
@@ -5212,6 +5230,7 @@ public:
   }
 
   void STDMETHODCALLTYPE TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D11_DESC *pDesc) final {
+    std::lock_guard<typename ContextInternalState::device_mutex_t> lock(ctx_->mutex);
     Rc<Texture> input, output, depth, motion_vector, exposure;
     if (!(input = static_cast<D3D11ResourceCommon *>(pDesc->Color)->texture()))
       return;
@@ -5243,6 +5262,7 @@ public:
       if(output->pixelFormat() != entry.output_pixel_format) continue;
       if(depth->pixelFormat() != entry.depth_pixel_format) continue;
       if(motion_vector_format != entry.motion_vector_pixel_format) continue;
+      if(pDesc->MotionVectorInDisplayRes != (entry.mv_downscaled != nullptr)) continue;
 
       scaler = entry.scaler;
       mv_downscaled = entry.mv_downscaled;
@@ -5282,7 +5302,7 @@ public:
         tex_info.depth = 1;
         tex_info.array_length = 1;
         tex_info.mipmap_level_count = 1;
-        tex_info.pixel_format = WMTPixelFormatRG32Float;
+        tex_info.pixel_format = motion_vector_format;
         tex_info.sample_count = 1;
         tex_info.type = WMTTextureType2D;
         tex_info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
@@ -5342,7 +5362,7 @@ public:
         WMTFXTemporalScalerProps new_props = props;
         new_props.motion_vector_scale_x = 1.0;
         new_props.motion_vector_scale_y = 1.0;
-        enc.upscaleTemporal(input, output, depth, mv_downscaled, 0, exposure, scaler, new_props);
+        enc.upscaleTemporal(input, output, depth, mv_downscaled, mv_downscaled->fullView, exposure, scaler, new_props);
       } else {
         enc.upscaleTemporal(input, output, depth, motion_vector, mv_view, exposure, scaler, props);
       }
@@ -5350,12 +5370,14 @@ public:
   }
 
   void STDMETHODCALLTYPE BeginUAVOverlap() final {
+    std::lock_guard<typename ContextInternalState::device_mutex_t> lock(ctx_->mutex);
     ctx_->EmitOP([](ArgumentEncodingContext &enc) {
       enc.setIntrapassBarrierControl(kIntrapassControlBitIgnoreUAVWaW);
     });
   }
 
   void STDMETHODCALLTYPE EndUAVOverlap() final {
+    std::lock_guard<typename ContextInternalState::device_mutex_t> lock(ctx_->mutex);
     ctx_->EmitOP([](ArgumentEncodingContext &enc) {
       enc.setIntrapassBarrierControl(0);
     });

@@ -34,11 +34,14 @@ enum class DirtyState {
   StencilRef,
   GraphicsPipelineState,
   ComputePipelineState,
+  Topology,
 };
 
 enum class DrawCallStatus {
   Invalid,
   Ordinary,
+  Geometry,
+  Tessellation,
 };
 
 inline bool
@@ -108,6 +111,85 @@ to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primiti
   return true;
 }
 
+inline std::pair<uint32_t, uint32_t>
+get_gs_vertex_count(D3D12_PRIMITIVE_TOPOLOGY primitive) {
+  switch (primitive) {
+  case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+    return {32, 31};
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+    return {32, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+    return {32, 29};
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+    return {32, 28};
+  case D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_5_CONTROL_POINT_PATCHLIST:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_6_CONTROL_POINT_PATCHLIST:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_7_CONTROL_POINT_PATCHLIST:
+    return {28, 28};
+  case D3D_PRIMITIVE_TOPOLOGY_8_CONTROL_POINT_PATCHLIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_9_CONTROL_POINT_PATCHLIST:
+    return {27, 27};
+  case D3D_PRIMITIVE_TOPOLOGY_10_CONTROL_POINT_PATCHLIST:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_11_CONTROL_POINT_PATCHLIST:
+    return {22, 22};
+  case D3D_PRIMITIVE_TOPOLOGY_12_CONTROL_POINT_PATCHLIST:
+    return {24, 24};
+  case D3D_PRIMITIVE_TOPOLOGY_13_CONTROL_POINT_PATCHLIST:
+    return {26, 26};
+  case D3D_PRIMITIVE_TOPOLOGY_14_CONTROL_POINT_PATCHLIST:
+    return {28, 28};
+  case D3D_PRIMITIVE_TOPOLOGY_15_CONTROL_POINT_PATCHLIST:
+    return {30, 30};
+  case D3D_PRIMITIVE_TOPOLOGY_16_CONTROL_POINT_PATCHLIST:
+    return {32, 32};
+  case D3D_PRIMITIVE_TOPOLOGY_17_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_18_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_19_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_20_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_21_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_22_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_23_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_24_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_25_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_26_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_27_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_28_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_29_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_30_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_31_CONTROL_POINT_PATCHLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST:
+    return {
+        uint32_t(primitive) - uint32_t(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) + 1,
+        uint32_t(primitive) - uint32_t(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) + 1
+    };
+  default:
+    break;
+  }
+  return {}; // unreachable
+}
+
 // `Graphics`CommandList is a really confusing name
 class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList> {
 
@@ -154,13 +236,8 @@ public:
 
   ~MTLD3D12GraphicsCommandListImpl() {}
 
-  HRESULT
-  Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
-    auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
-
-    if (allocator_ != allocator)
-      allocator_ = allocator;
-
+  void
+  ResetState(ID3D12PipelineState *pInitialPipelineState) {
     pso_graphics_ = nullptr;
     pso_compute_ = nullptr;
     if (auto pso = static_cast<MTLD3D12PipelineState *>(pInitialPipelineState)) {
@@ -202,6 +279,16 @@ public:
     index_offset = 0;
 
     dirty_state_.clrAll();
+  }
+
+  HRESULT
+  Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
+    auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
+
+    if (allocator_ != allocator)
+      allocator_ = allocator;
+
+    ResetState(pInitialPipelineState);
 
     encoder_count = std::numeric_limits<size_t>::max();
     return allocator_->StartRecord(&entry);
@@ -248,7 +335,11 @@ public:
     return Initialize(pAllocator, pInitialState);
   };
 
-  void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pPipelineState) { IMPLEMENT_ME };
+  void STDMETHODCALLTYPE
+  ClearState(ID3D12PipelineState *pPipelineState) {
+    allocator_->InvalidateCurrentPass();
+    ResetState(pPipelineState);
+  };
 
   std::tuple<uint64_t, uint64_t>
   PopulateVertexBufferTable(uint32_t Count) {
@@ -278,19 +369,6 @@ public:
     }
 
     return {offset, stride};
-  }
-
-  void
-  EncodeVertexBuffers() {
-    auto [Offset, Stride] = PopulateVertexBufferTable(1);
-    if (!Stride)
-      return;
-
-    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
-    cmd.type = WMTRenderCommandSetVertexBuffer;
-    cmd.buffer = allocator_->gpu_heap_buffer_;
-    cmd.offset = Offset;
-    cmd.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
   }
 
   DrawCallStatus
@@ -364,21 +442,29 @@ public:
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
+      dirty_state_.set(DirtyState::Topology);
       dirty_state_.set(DirtyState::GraphicsPipelineState);
     }
 
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
 
+    if (pso_graphics_->is_geometry && dirty_state_.test(DirtyState::Topology)) {
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+      dirty_state_.clr(DirtyState::Topology);
+    }
+
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
       cmd_setpso.type = WMTRenderCommandSetPSO;
-      cmd_setpso.pso = pso_graphics_->pso;
+      cmd_setpso.pso = pso_graphics_->GetRenderPipelineVariant(topology_);
 
-      auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdsso>();
-      cmd_setdsso.type = WMTRenderCommandSetDSSO;
-      cmd_setdsso.dsso = pso_graphics_->dsso;
-      cmd_setdsso.stencil_ref = stencil_ref_;
+      auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
+      cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
+      cmd_setdsso.depth_stencil_state = pso_graphics_->GetDepthStencilState(
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->dsv_planar_flags,
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->dsv_readonly_flags
+      );
 
       auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       cmd_setrs.type = WMTRenderCommandSetRasterizerState;
@@ -392,8 +478,25 @@ public:
 
       dirty_state_.clr(DirtyState::GraphicsPipelineState);
     }
+
+    auto status = pso_graphics_->is_geometry ? DrawCallStatus::Geometry
+                  : pso_graphics_->is_tess   ? DrawCallStatus::Tessellation
+                                             : DrawCallStatus::Ordinary;
+
     if (dirty_state_.test(DirtyState::VertexBuffer)) {
-      EncodeVertexBuffers();
+      auto [Offset, Stride] = PopulateVertexBufferTable(1);
+      if (Stride) {
+        auto &cmd_vsvb = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_vsvb.type = WMTRenderCommandSetVertexBuffer;
+        cmd_vsvb.buffer = allocator_->gpu_heap_buffer_;
+        cmd_vsvb.offset = Offset;
+        cmd_vsvb.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
+        auto &cmd_osvb = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_osvb.type = WMTRenderCommandSetObjectBuffer;
+        cmd_osvb.buffer = allocator_->gpu_heap_buffer_;
+        cmd_osvb.offset = Offset;
+        cmd_osvb.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
+      }
       dirty_state_.clr(DirtyState::VertexBuffer);
     }
 
@@ -410,6 +513,16 @@ public:
         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
         cmd_fsargbuf.offset = Offset;
         cmd_fsargbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
+        auto &cmd_osargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_osargbuf.type = WMTRenderCommandSetObjectBuffer;
+        cmd_osargbuf.buffer = allocator_->gpu_heap_buffer_;
+        cmd_osargbuf.offset = Offset;
+        cmd_osargbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
+        auto &cmd_msargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_msargbuf.type = WMTRenderCommandSetMeshBuffer;
+        cmd_msargbuf.buffer = allocator_->gpu_heap_buffer_;
+        cmd_msargbuf.offset = Offset;
+        cmd_msargbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
       }
       dirty_state_.clr(DirtyState::GraphicsRootArguments);
     }
@@ -427,6 +540,16 @@ public:
         cmd_fsargbuf.buffer = allocator_->gpu_heap_buffer_;
         cmd_fsargbuf.offset = Offset;
         cmd_fsargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
+        auto &cmd_osargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_osargbuf.type = WMTRenderCommandSetObjectBuffer;
+        cmd_osargbuf.buffer = allocator_->gpu_heap_buffer_;
+        cmd_osargbuf.offset = Offset;
+        cmd_osargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
+        auto &cmd_msargbuf = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        cmd_msargbuf.type = WMTRenderCommandSetMeshBuffer;
+        cmd_msargbuf.buffer = allocator_->gpu_heap_buffer_;
+        cmd_msargbuf.offset = Offset;
+        cmd_msargbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
       }
       dirty_state_.clr(DirtyState::GraphicsRootSignature);
     }
@@ -483,8 +606,18 @@ public:
       dirty_state_.clr(DirtyState::StencilRef);
     }
 
-    return DrawCallStatus::Ordinary;
+    return status;
   }
+
+  struct DXMT_DRAW_DYNAMIC_IB_ARGUMENTS {
+    UINT VertexOrIndexCountPerInstance;
+    UINT InstanceCount;
+    UINT StartVertexOrIndexLocation;
+    INT BaseVertexLocation;
+    UINT StartInstanceLocation;
+    DXGI_FORMAT IndexFormat;
+    D3D12_GPU_VIRTUAL_ADDRESS IndexBuffer;
+  };
 
   void STDMETHODCALLTYPE
   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) {
@@ -495,6 +628,64 @@ public:
     DrawCallStatus status = PreDraw();
     if (status == DrawCallStatus::Invalid)
       return;
+
+    if (status == DrawCallStatus::Geometry) {
+      auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_DYNAMIC_IB_ARGUMENTS), 32);
+      DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *draw_argument = reinterpret_cast<DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *>(Ptr);
+      draw_argument->StartVertexOrIndexLocation = StartVertexLocation;
+      draw_argument->VertexOrIndexCountPerInstance = VertexCountPerInstance;
+      draw_argument->InstanceCount = InstanceCount;
+      draw_argument->StartInstanceLocation = StartInstanceLocation;
+      draw_argument->BaseVertexLocation = 0;
+      draw_argument->IndexFormat = DXGI_FORMAT_UNKNOWN;
+      draw_argument->IndexBuffer = 0;
+
+      auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topology_);
+      auto warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+
+      auto &cmd_update_draw_args = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+      cmd_update_draw_args.type = WMTRenderCommandSetObjectBuffer;
+      cmd_update_draw_args.buffer = allocator_->gpu_heap_buffer_;
+      cmd_update_draw_args.offset = Offset;
+      cmd_update_draw_args.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
+
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
+      cmd.type = WMTRenderCommandDrawMeshThreadgroups;
+      cmd.threadgroup_per_grid = {warp_count, InstanceCount, 1};
+      cmd.object_threadgroup_size = {vertex_per_warp, 1, 1};
+      cmd.mesh_threadgroup_size = {1, 1, 1};
+      return;
+    }
+
+    if (status == DrawCallStatus::Tessellation) {
+      auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_DYNAMIC_IB_ARGUMENTS), 32);
+      DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *draw_argument = reinterpret_cast<DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *>(Ptr);
+      draw_argument->StartVertexOrIndexLocation = StartVertexLocation;
+      draw_argument->VertexOrIndexCountPerInstance = VertexCountPerInstance;
+      draw_argument->InstanceCount = InstanceCount;
+      draw_argument->StartInstanceLocation = StartInstanceLocation;
+      draw_argument->BaseVertexLocation = 0;
+      draw_argument->IndexFormat = DXGI_FORMAT_UNKNOWN;
+      draw_argument->IndexBuffer = 0;
+
+      auto PatchCountPerInstance = VertexCountPerInstance / cp_count;
+      auto PatchPerGroup = 32 / pso_graphics_->tess_threads_per_patch;
+      auto ThreadsPerPatch = pso_graphics_->tess_threads_per_patch;
+      auto PatchPerObjectInstance = (PatchCountPerInstance - 1) / PatchPerGroup + 1;
+
+      auto &cmd_update_draw_args = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+      cmd_update_draw_args.type = WMTRenderCommandSetObjectBuffer;
+      cmd_update_draw_args.buffer = allocator_->gpu_heap_buffer_;
+      cmd_update_draw_args.offset = Offset;
+      cmd_update_draw_args.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
+
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
+      cmd.type = WMTRenderCommandDrawMeshThreadgroups;
+      cmd.threadgroup_per_grid = {PatchPerObjectInstance, InstanceCount, 1};
+      cmd.object_threadgroup_size = {ThreadsPerPatch, PatchPerGroup, 1};
+      cmd.mesh_threadgroup_size = {32, 1, 1};
+      return;
+    }
 
     auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
     cmd_draw.type = WMTRenderCommandDraw;
@@ -517,6 +708,65 @@ public:
     DrawCallStatus status = PreDraw();
     if (status == DrawCallStatus::Invalid)
       return;
+
+    if (status == DrawCallStatus::Geometry) {
+      auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_DYNAMIC_IB_ARGUMENTS), 32);
+      DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *draw_argument = reinterpret_cast<DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *>(Ptr);
+      draw_argument->VertexOrIndexCountPerInstance = IndexCountPerInstance;
+      draw_argument->InstanceCount = InstanceCount;
+      draw_argument->StartVertexOrIndexLocation = StartVertexLocation;
+      draw_argument->BaseVertexLocation = BaseVertexLocation;
+      draw_argument->StartInstanceLocation = StartInstanceLocation;
+      draw_argument->IndexFormat = index_type == WMTIndexTypeUInt16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+      draw_argument->IndexBuffer = index_buffer_address;
+
+      auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topology_);
+      auto warp_count = (IndexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+
+      auto &cmd_update_draw_args = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+      cmd_update_draw_args.type = WMTRenderCommandSetObjectBuffer;
+      cmd_update_draw_args.buffer = allocator_->gpu_heap_buffer_;
+      cmd_update_draw_args.offset = Offset;
+      cmd_update_draw_args.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
+
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
+      cmd.type = WMTRenderCommandDrawMeshThreadgroups;
+      cmd.threadgroup_per_grid = {warp_count, InstanceCount, 1};
+      cmd.object_threadgroup_size = {vertex_per_warp, 1, 1};
+      cmd.mesh_threadgroup_size = {1, 1, 1};
+      return;
+    }
+
+    if (status == DrawCallStatus::Tessellation) {
+      auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(DXMT_DRAW_DYNAMIC_IB_ARGUMENTS), 64);
+      DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *draw_argument = reinterpret_cast<DXMT_DRAW_DYNAMIC_IB_ARGUMENTS *>(Ptr);
+      draw_argument->VertexOrIndexCountPerInstance = IndexCountPerInstance;
+      draw_argument->InstanceCount = InstanceCount;
+      draw_argument->StartVertexOrIndexLocation = StartVertexLocation;
+      draw_argument->BaseVertexLocation = BaseVertexLocation;
+      draw_argument->StartInstanceLocation = StartInstanceLocation;
+      draw_argument->IndexFormat = index_type == WMTIndexTypeUInt16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+      draw_argument->IndexBuffer = index_buffer_address;
+
+      auto PatchCountPerInstance = IndexCountPerInstance / cp_count;
+      auto PatchPerGroup = 32 / pso_graphics_->tess_threads_per_patch;
+      auto ThreadsPerPatch = pso_graphics_->tess_threads_per_patch;
+      auto PatchPerObjectInstance = (PatchCountPerInstance - 1) / PatchPerGroup + 1;
+
+      auto &cmd_update_draw_args = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+      cmd_update_draw_args.type = WMTRenderCommandSetObjectBuffer;
+      cmd_update_draw_args.buffer = allocator_->gpu_heap_buffer_;
+      cmd_update_draw_args.offset = Offset;
+      cmd_update_draw_args.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
+
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups>();
+      cmd.type = WMTRenderCommandDrawMeshThreadgroups;
+      cmd.threadgroup_per_grid = {PatchPerObjectInstance, InstanceCount, 1};
+      cmd.object_threadgroup_size = {ThreadsPerPatch, PatchPerGroup, 1};
+      cmd.mesh_threadgroup_size = {32, 1, 1};
+      return;
+    }
+
     auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed>();
     cmd_draw.type = WMTRenderCommandDrawIndexed;
     cmd_draw.primitive_type = primitive_type;
@@ -941,7 +1191,10 @@ public:
 
   void STDMETHODCALLTYPE
   IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY Topology) {
-    topology_ = Topology;
+    if (topology_ != Topology) {
+      topology_ = Topology;
+      dirty_state_.set(DirtyState::Topology);
+    }
   };
 
   void STDMETHODCALLTYPE
@@ -981,7 +1234,9 @@ public:
 
   void STDMETHODCALLTYPE
   OMSetStencilRef(UINT StencilRef) {
-    stencil_ref_ = StencilRef;
+    if (stencil_ref_ == (UINT8)StencilRef)
+      return;
+    stencil_ref_ = (UINT8)StencilRef;
     dirty_state_.set(DirtyState::StencilRef);
   };
 
@@ -1226,20 +1481,32 @@ public:
       D3D12_CPU_DESCRIPTOR_HANDLE DSV, D3D12_CLEAR_FLAGS Flags, FLOAT Depth, UINT8 Stencil, UINT RectCount,
       const D3D12_RECT *Rects
   ) {
-    if (Rects || RectCount > 1) {
-      ERR("ClearDepthStencilView: unhandled parameter Rects=", Rects, " RectCount=", RectCount);
-      return;
-    }
-    if ((Flags & 3) == 0)
-      return;
     auto [Heap, Index] = GetRenderTargetHeap(device_, DSV);
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
     if (!AttachmentDesc.Texture)
       return;
+    auto CheckedFlags = Flags & DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
+    if (!CheckedFlags)
+      return;
+    if (Rects) {
+      allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
+      for (unsigned i = 0; i < RectCount; i++) {
+        auto rect = Rects[i];
+        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
+        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
+        int32_t rect_width = rect.right - rect_offset_x;
+        int32_t rect_height = rect.bottom - rect_offset_y;
+        if (rect_height <= 0 || rect_width <= 0)
+          continue;
+        allocator_->clear_rtv_.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, Depth, Stencil);
+      }
+      allocator_->clear_rtv_.end();
+      return;
+    }
     allocator_->InvalidateCurrentPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
-    encoder_info->clear_dsv = Flags & 3;
+    encoder_info->clear_dsv = CheckedFlags;
     encoder_info->depth_stencil = {Depth, Stencil};
     encoder_info->attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
     encoder_info->array_length = AttachmentDesc.RenderTargetArrayLength;
@@ -1254,14 +1521,28 @@ public:
   ClearRenderTargetView(
       D3D12_CPU_DESCRIPTOR_HANDLE RTV, const FLOAT Color[4], UINT RectCount, const D3D12_RECT *Rects
   ) {
-    if (Rects || RectCount > 1) {
-      ERR("ClearRenderTargetView: unhandled parameter Rects=", Rects, " RectCount=", RectCount);
-      return;
-    }
     auto [Heap, Index] = GetRenderTargetHeap(device_, RTV);
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
     if (!AttachmentDesc.Texture)
       return;
+    if (Rects) {
+      allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
+      for (unsigned i = 0; i < RectCount; i++) {
+        auto rect = Rects[i];
+        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
+        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
+        int32_t rect_width = rect.right - rect_offset_x;
+        int32_t rect_height = rect.bottom - rect_offset_y;
+        if (rect_height <= 0 || rect_width <= 0)
+          continue;
+        allocator_->clear_rtv_.clear(
+            rect_offset_x, rect_offset_y, rect_width, rect_height, AttachmentDesc.RenderTargetArrayLength,
+            {Color[0], Color[1], Color[2], Color[3]}
+        );
+      }
+      allocator_->clear_rtv_.end();
+      return;
+    }
     allocator_->InvalidateCurrentPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
@@ -1350,10 +1631,10 @@ public:
       break;
     }
     case ShaderVisibleDescriptorType::UAVTexture: {
-      allocator_->clear_uav_.begin(color, Descriptor.SRVTexture.texture, Descriptor.SRVTexture.view);
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
       full_rect = {
-          0, 0, (LONG)Descriptor.SRVTexture.texture->width(Descriptor.SRVTexture.view),
-          (LONG)Descriptor.SRVTexture.texture->height(Descriptor.SRVTexture.view)
+          0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
+          (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
       };
       break;
     }
@@ -1523,7 +1804,29 @@ public:
   WriteBufferImmediate(
       UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE *pModes
   ) {
-    IMPLEMENT_ME
+    /**
+    FIXME: mode is deliberately ignored for now
+    TODO(fence): needs guarantee of this blit pass waiting all previous commands
+    */
+    if (!pParams || !PreBlit())
+      return;
+
+    auto [Mapped, Offset] = allocator_->AllocateGPUHeap(Count * sizeof(uint32_t), 16);
+    for (unsigned i = 0; i < Count; i++) {
+      uint64_t DstOffset;
+      auto Dst = device_->LookupBufferByVA(pParams[i].Dest, &DstOffset);
+      if (!Dst)
+        continue;
+
+      reinterpret_cast<uint32_t *>(Mapped)[i] = pParams[i].Value;
+      auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+      cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+      cmd_cp.src = allocator_->gpu_heap_buffer_;
+      cmd_cp.dst = Dst->buffer();
+      cmd_cp.src_offset = Offset + i * sizeof(uint32_t);
+      cmd_cp.dst_offset = DstOffset;
+      cmd_cp.copy_length = sizeof(uint32_t);
+    }
   }
 };
 

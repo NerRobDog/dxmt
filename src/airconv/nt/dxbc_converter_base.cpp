@@ -48,6 +48,11 @@ Converter::LoadOperandIndex(const IndexByTempComponent &SrcOpIndex) {
 }
 
 llvm::Value *
+Converter::LoadOperandIndex(const IndexByControlPointId &SrcOpIndex) {
+  return ir.CreateAdd(res.thread_id_in_patch, ir.getInt32(SrcOpIndex.offset));
+}
+
+llvm::Value *
 Converter::LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex) {
   auto Comp = SrcOpIndex.component;
   SrcOperandIndexableTemp RelReg{
@@ -226,6 +231,7 @@ Converter::LoadOperand(const SrcOperandAttribute &SrcOp, mask_t Mask) {
   switch (SrcOp.attribute) {
   case InputAttribute::VertexId:
   case InputAttribute::InstanceId:
+  case InputAttribute::SampleIndex:
     assert(0 && "never reached: should be handled separately");
     break;
   case InputAttribute::ThreadId: {
@@ -336,7 +342,7 @@ Converter::LoadOperand(const SrcOperandInputICP &SrcOp, mask_t Mask) {
   auto TyHandle = GetArrayType(Handle);
 
   auto CPId = LoadOperandIndex(SrcOp.cpid);
-  auto RegId = ir.getInt32(SrcOp.regid);
+  auto RegId = LoadOperandIndex(SrcOp.regid);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -377,7 +383,7 @@ Converter::LoadOperand(const SrcOperandInputOCP &SrcOp, mask_t Mask) {
   auto TyHandle = GetArrayType(Handle);
 
   auto CPId = LoadOperandIndex(SrcOp.cpid);
-  auto RegId = ir.getInt32(SrcOp.regid);
+  auto RegId = LoadOperandIndex(SrcOp.regid);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -1011,7 +1017,10 @@ Converter::operator()(const InstIntegerUnaryOp &unary) {
   case IntegerUnaryOp::FirstHiBitSigned:
     Value = ir.CreateSelect(
         ir.CreateIsNotNeg(Value), air.CreateCountZero(Value, false),
-        ir.CreateAdd(air.CreateCountZero(ir.CreateShl(ir.CreateNot(Value), ir.getInt32(1)), false), ir.getInt32(1))
+        ir.CreateAdd(
+            air.CreateCountZero(ir.CreateShl(ir.CreateNot(Value), 1ull), false),
+            llvm::ConstantInt::get(Value->getType(), 1)
+        )
     );
     Value = MaxIfInMask(~((uint32_t)0x1f), Value);
     break;
@@ -2560,11 +2569,9 @@ Converter::LoadInterpolant(uint32_t Index) {
     return {};
 
   auto interpolant = res.interpolant_map[Index];
-  auto h = interpolant.interpolant(nullptr).build(ctx);
-  if (h.takeError())
-    return {};
+  auto h = ctx.function->getArg(interpolant.arg_index);
 
-  return llvm::Optional<InterpolantHandle>({h.get(), interpolant.perspective});
+  return llvm::Optional<InterpolantHandle>({h, interpolant.perspective});
 }
 
 void
@@ -2636,18 +2643,14 @@ Converter::operator()(const InstMaskedSumOfAbsDiff &msad) {
 
   StoreOperand(msad.dst, Result);
 }
-
 void
 Converter::operator()(const InstEmit &) {
-  if (res.call_emit().build(ctx).takeError()) {
-    // TODO
-  }
+  res.call_emit();
 }
+
 void
 Converter::operator()(const InstCut &) {
-  if (res.call_cut().build(ctx).takeError()) {
-    // TODO
-  }
+  res.call_cut();
 }
 
 llvm::Value *
